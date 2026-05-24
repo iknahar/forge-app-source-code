@@ -1,0 +1,3053 @@
+import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
+
+// MARK: - Custom toggle (iOS-style capsule with spring)
+
+struct ForgeToggleStyle: ToggleStyle {
+    var tint: Color = ForgeTheme.Colors.accent
+
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 8) {
+            configuration.label
+            Capsule()
+                .fill(configuration.isOn ? tint : Color.black.opacity(0.13))
+                .frame(width: 36, height: 20)
+                .overlay(
+                    Circle()
+                        .fill(Color.white)
+                        .shadow(color: .black.opacity(0.2), radius: 1.5, y: 0.8)
+                        .padding(2)
+                        .offset(x: configuration.isOn ? 8 : -8)
+                )
+                .animation(.spring(response: 0.22, dampingFraction: 0.75), value: configuration.isOn)
+                .onTapGesture { configuration.isOn.toggle() }
+        }
+    }
+}
+
+extension ToggleStyle where Self == ForgeToggleStyle {
+    static var forge: ForgeToggleStyle { ForgeToggleStyle() }
+}
+
+/// Forge Preferences — 960×660, top tabs + live preview pane.
+/// Rich visual design: hero headers, layered cards, accent CTAs.
+struct SettingsView: View {
+    @EnvironmentObject var moduleRegistry: ModuleRegistry
+    @EnvironmentObject var settings: SettingsManager
+    @State private var selectedSection: SettingsSection = .general
+
+    enum SettingsSection: String, CaseIterable, Identifiable {
+        case general    = "General"
+        case modules    = "Modules"
+        case calendar   = "Calendar"
+        case windows    = "Windows"
+        case menuBar    = "Menu Bar"
+        case shortcuts  = "Shortcuts"
+        case about      = "About"
+
+        var id: String { rawValue }
+
+        var iconName: String {
+            switch self {
+            case .general:    return "gearshape.fill"
+            case .modules:    return "square.grid.2x2.fill"
+            case .calendar:   return "calendar"
+            case .windows:    return "rectangle.split.3x1.fill"
+            case .menuBar:    return "menubar.rectangle"
+            case .shortcuts:  return "keyboard.fill"
+            case .about:      return "info.circle.fill"
+            }
+        }
+
+        var subtitle: String {
+            switch self {
+            case .general:    return "Appearance, time format, and startup behavior."
+            case .modules:    return "Enable or disable individual tools. Disabled modules consume zero CPU."
+            case .calendar:   return "Meeting reminders, focus signals, and connected calendars."
+            case .windows:    return "Snap zones, always-on-top borders, and workspace recall."
+            case .menuBar:    return "Compose what shows next to the hammer icon."
+            case .shortcuts:  return "Re-record any global hotkey. Changes register live."
+            case .about:      return "Local-first. No telemetry. No accounts."
+            }
+        }
+    }
+
+    @State private var previewIsDark: Bool = false
+
+    private func pickReminderBackground() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.title = "Pick a fullscreen reminder background"
+        if panel.runModal() == .OK, let url = panel.url {
+            settings.reminderBackgroundImagePath = url.path
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Top tab bar (replaces sidebar)
+            SettingsTopTabs(selected: $selectedSection)
+                .background(ForgeTheme.Colors.pageBgWarm)
+                .overlay(
+                    Rectangle()
+                        .fill(Color.black.opacity(0.06))
+                        .frame(height: 1),
+                    alignment: .bottom
+                )
+
+            // Main split: settings (left) + preview (right)
+            HStack(spacing: 0) {
+                // Settings content — NSScrollView-backed for reliable scroll wheel.
+                // .frame(maxWidth: .infinity) is critical so the scroll-view
+                // wrapper expands to fill the remaining HStack width instead of
+                // shrinking to its intrinsic 0pt size and getting clipped by
+                // the preview pane on the right.
+                ScrollableContainer {
+                    VStack(alignment: .leading, spacing: 24) {
+                        SectionHero(
+                            title: selectedSection.rawValue,
+                            subtitle: selectedSection.subtitle
+                        )
+
+                        Group {
+                            switch selectedSection {
+                            case .general:    generalSettings
+                            case .modules:    modulesSettings
+                            case .calendar:   calendarSettings
+                            case .windows:    windowSettings
+                            case .menuBar:    menuBarSettings
+                            case .shortcuts:  shortcutsSettings
+                            case .about:      aboutSection
+                            }
+                        }
+                    }
+                    // Tighter horizontal padding (was 28) so cards have more
+                    // room — the preview pane was eating into the content.
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 24)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(ForgeTheme.Colors.pageBg)
+
+                // Preview pane (right) — shown ONLY on the Calendar and
+                // Menu Bar tabs (the two surfaces where users actively
+                // shape the appearance and a live preview is genuinely
+                // useful). Other tabs hide it so the content area
+                // claims the full window width.
+                let showsPreview: Bool = {
+                    switch selectedSection {
+                    case .calendar, .menuBar: return true
+                    default:                  return false
+                    }
+                }()
+                if showsPreview {
+                    SettingsPreviewPane(
+                        section: selectedSection,
+                        settings: settings,
+                        moduleRegistry: moduleRegistry,
+                        previewIsDark: $previewIsDark
+                    )
+                    // Narrowed (was 320) so the settings content area gets
+                    // ~40pt more room — fixes World Clock / token chip clip.
+                    .frame(width: 280)
+                    .background(ForgeTheme.Colors.pageBgWarm.opacity(0.6))
+                    .overlay(
+                        Rectangle()
+                            .fill(ForgeTheme.Colors.borderDefault)
+                            .frame(width: 1),
+                        alignment: .leading
+                    )
+                }
+            }
+        }
+        // Widened (was 960) to give every tab room for both settings content
+        // and the live preview pane without things getting clipped.
+        .frame(width: 1020, height: 660)
+        .background(ForgeTheme.Colors.pageBg)
+        .preferredColorScheme(settings.theme.colorScheme)
+    }
+
+    // MARK: - General
+
+    private var generalSettings: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            SettingsCard(
+                title: "Appearance",
+                description: "Match the system, or force a theme."
+            ) {
+                SettingRow(
+                    icon: "paintpalette.fill",
+                    iconTint: .purple,
+                    title: "Theme",
+                    description: "Affects popover, settings, and command palette."
+                ) {
+                    ForgeSegmentedPicker(
+                        selection: $settings.theme,
+                        options: SettingsManager.AppTheme.allCases.map {
+                            (label: $0.rawValue, value: $0)
+                        }
+                    )
+                    .frame(width: 220)
+                }
+            }
+
+            SettingsCard(title: "Behavior") {
+                VStack(spacing: 14) {
+                    SettingRow(
+                        icon: "clock.fill",
+                        iconTint: .blue,
+                        title: "Use 24-hour time",
+                        description: "Affects calendar, world clock, and meeting countdowns."
+                    ) {
+                        Toggle("", isOn: $settings.use24HourTime)
+                            .toggleStyle(.forge)
+                            .labelsHidden()
+                            .tint(ForgeTheme.Colors.accent)
+                    }
+
+                    Divider().opacity(0.3)
+
+                    SettingRow(
+                        icon: "power",
+                        iconTint: .green,
+                        title: "Launch at login",
+                        description: "Forge starts automatically when you sign in."
+                    ) {
+                        Toggle("", isOn: .constant(false))
+                            .toggleStyle(.forge)
+                            .labelsHidden()
+                            .tint(ForgeTheme.Colors.accent)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Modules
+
+    private var modulesSettings: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            // Stats summary card
+            let visible = moduleRegistry.modules.filter {
+                !["calendar", "commandPalette"].contains($0.id)
+            }
+            let totalModules = visible.count
+            let enabledCount = visible.filter { moduleRegistry.isEnabled($0.id) }.count
+
+            SettingsCard {
+                HStack(spacing: 20) {
+                    StatPill(value: "\(enabledCount)", label: "Active", tint: ForgeTheme.Colors.accent)
+                    StatPill(value: "\(totalModules - enabledCount)", label: "Disabled", tint: .secondary)
+                    StatPill(value: "\(totalModules)", label: "Total", tint: .blue)
+                    Spacer()
+                }
+            }
+
+            // Hide core surfaces (Calendar, Command Palette) from the Modules
+            // list — those aren't user-toggleable utilities.
+            let hiddenIds: Set<String> = ["calendar", "commandPalette"]
+
+            ForEach(ModuleCategory.allCases) { category in
+                let categoryModules = moduleRegistry
+                    .modules(in: category)
+                    .filter { !hiddenIds.contains($0.id) }
+                if !categoryModules.isEmpty {
+                    SettingsCard(
+                        title: category.rawValue,
+                        titleIcon: category.iconName
+                    ) {
+                        VStack(spacing: 0) {
+                            ForEach(Array(categoryModules.enumerated()), id: \.element.id) { index, module in
+                                if index > 0 {
+                                    Divider().opacity(0.3)
+                                }
+                                ModuleRowSetting(module: module, registry: moduleRegistry)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Calendar
+
+    private var calendarSettings: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            SettingsCard(
+                title: "Calendar Display",
+                titleIcon: "calendar",
+                description: "Tune how the calendar popover looks. Changes apply instantly."
+            ) {
+                VStack(spacing: 10) {
+                    SettingRow(icon: "chart.bar.fill", iconTint: .blue,
+                               title: "Year progress bar",
+                               description: "Show % of the year complete at the top.") {
+                        Toggle("", isOn: $settings.showYearProgress)
+                            .toggleStyle(.forge).labelsHidden().tint(ForgeTheme.Colors.accent)
+                    }
+                    Divider().opacity(0.3)
+                    SettingRow(icon: "clock.badge.checkmark.fill", iconTint: .cyan,
+                               title: "Day progress bar",
+                               description: "Show % of today elapsed + time left.") {
+                        Toggle("", isOn: $settings.showDayProgress)
+                            .toggleStyle(.forge).labelsHidden().tint(ForgeTheme.Colors.accent)
+                    }
+                    Divider().opacity(0.3)
+                    SettingRow(icon: "globe.americas.fill", iconTint: .green,
+                               title: "World clock",
+                               description: "Time zone strip at the bottom of the popover.") {
+                        Toggle("", isOn: $settings.showWorldClock)
+                            .toggleStyle(.forge).labelsHidden().tint(ForgeTheme.Colors.accent)
+                    }
+                    Divider().opacity(0.3)
+                    SettingRow(icon: "number", iconTint: .indigo,
+                               title: "Week numbers",
+                               description: "ISO week number on the left of each row.") {
+                        Toggle("", isOn: $settings.showWeekNumbers)
+                            .toggleStyle(.forge).labelsHidden().tint(ForgeTheme.Colors.accent)
+                    }
+                    Divider().opacity(0.3)
+                    SettingRow(icon: "circle.lefthalf.filled", iconTint: .yellow,
+                               title: "Highlight today",
+                               description: "Today's date gets the accent square.") {
+                        Toggle("", isOn: $settings.highlightToday)
+                            .toggleStyle(.forge).labelsHidden().tint(ForgeTheme.Colors.accent)
+                    }
+                    Divider().opacity(0.3)
+                    SettingRow(icon: "moon.zzz.fill", iconTint: .purple,
+                               title: "Dim weekends",
+                               description: "Saturdays and Sundays appear muted.") {
+                        Toggle("", isOn: $settings.dimWeekends)
+                            .toggleStyle(.forge).labelsHidden().tint(ForgeTheme.Colors.accent)
+                    }
+                    Divider().opacity(0.3)
+                    SettingRow(icon: "circle.dotted", iconTint: .red,
+                               title: "Event dots",
+                               description: "How busy days are marked in the grid.") {
+                        Picker("", selection: $settings.eventDotStyle) {
+                            ForEach(SettingsManager.EventDotStyle.allCases, id: \.self) { style in
+                                Text(style.rawValue).tag(style)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(width: 140)
+                    }
+                    Divider().opacity(0.3)
+                    SettingRow(icon: "calendar.day.timeline.left", iconTint: .pink,
+                               title: "Week starts on",
+                               description: "First column of the calendar grid.") {
+                        ForgeSegmentedPicker(
+                            selection: $settings.weekStartsOnMonday,
+                            options: [
+                                (label: "Sun", value: false),
+                                (label: "Mon", value: true),
+                            ]
+                        )
+                        .frame(width: 140)
+                    }
+                }
+            }
+
+            SettingsCard(
+                title: "World Clock",
+                titleIcon: "globe.americas.fill",
+                description: "Cities shown in the strip at the bottom of the calendar popover."
+            ) {
+                WorldClockEditor(settings: settings)
+            }
+
+            SettingsCard(
+                title: "Meeting Reminders",
+                titleIcon: "bell.badge.fill",
+                description: "Show a reminder before each meeting begins."
+            ) {
+                VStack(spacing: 14) {
+                    SettingRow(
+                        icon: "clock.arrow.circlepath",
+                        iconTint: .orange,
+                        title: "Remind me",
+                        description: "How far ahead the prompt appears."
+                    ) {
+                        Picker("", selection: $settings.meetingReminderMinutes) {
+                            Text("At start").tag(0)
+                            Text("1 min").tag(1)
+                            Text("5 min").tag(5)
+                            Text("10 min").tag(10)
+                            Text("15 min").tag(15)
+                        }
+                        .labelsHidden()
+                        .frame(width: 140)
+                    }
+
+                    Divider().opacity(0.3)
+
+                    SettingRow(
+                        icon: "rectangle.center.inset.filled",
+                        iconTint: .pink,
+                        title: "Reminder style",
+                        description: "How the prompt presents itself."
+                    ) {
+                        Picker("", selection: $settings.meetingReminderStyle) {
+                            ForEach(SettingsManager.ReminderStyle.allCases, id: \.self) { style in
+                                Text(style.rawValue).tag(style)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .frame(width: 140)
+                    }
+
+                    // Full-screen background image picker — only meaningful
+                    // when style is Full Screen; row still shows in both
+                    // modes so the user can preset it.
+                    Divider().opacity(0.3)
+                    SettingRow(
+                        icon: "photo.fill",
+                        iconTint: .indigo,
+                        title: "Fullscreen background",
+                        description: "Pick a wallpaper for the fullscreen alert."
+                    ) {
+                        HStack(spacing: 6) {
+                            Text(settings.reminderBackgroundImagePath
+                                 .flatMap { URL(fileURLWithPath: $0).lastPathComponent }
+                                 ?? "Default stripes")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .frame(maxWidth: 140, alignment: .trailing)
+                            Button("Pick…") { pickReminderBackground() }
+                                .controlSize(.small)
+                            if settings.reminderBackgroundImagePath != nil {
+                                Button("Reset") {
+                                    settings.reminderBackgroundImagePath = nil
+                                }
+                                .controlSize(.small)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Linked Calendars removed — Google native + EventKit is the single
+            // source of truth now. Color is picked when connecting Google;
+            // EventKit calendars use their native colors.
+
+            SettingsCard(
+                title: "Google Calendar (Native)",
+                titleIcon: "g.circle.fill",
+                description: "Sign into Google to give Forge native access — needed for declining meetings with a note, and richer event editing."
+            ) {
+                GoogleAccountsEditor()
+            }
+        }
+    }
+
+    // MARK: - Command Bar
+
+    private var commandBarSettings: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            // Big hero card showcasing the feature, à la Dot
+            SettingsCard {
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack(spacing: 12) {
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundColor(ForgeTheme.Colors.accent)
+                            .frame(width: 36, height: 36)
+                            .background(ForgeTheme.Colors.accent.opacity(0.15))
+                            .clipShape(RoundedRectangle(cornerRadius: 9))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Spotlight, for Forge.")
+                                .font(.system(size: 16, weight: .semibold))
+                            Text("Search, create, and manage events in one combo.")
+                                .font(.system(size: 12))
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        ShortcutPill(text: settings.binding(for: "commandPalette").displayString)
+                    }
+
+                    HStack(spacing: 10) {
+                        FeaturePill(icon: "command", label: "Launch from anywhere")
+                        FeaturePill(icon: "text.cursor", label: "Natural input")
+                        FeaturePill(icon: "globe", label: "World clock")
+                    }
+                }
+            }
+
+            SettingsCard(
+                title: "Behavior",
+                description: "Change the keybinding in Shortcuts → Command Bar."
+            ) {
+                SettingRow(
+                    icon: "rectangle.dashed",
+                    iconTint: .indigo,
+                    title: "Show on all spaces",
+                    description: "Floating palette ignores Mission Control spaces."
+                ) {
+                    Toggle("", isOn: .constant(true))
+                        .toggleStyle(.forge)
+                        .labelsHidden()
+                        .tint(ForgeTheme.Colors.accent)
+                }
+            }
+        }
+    }
+
+    // MARK: - Windows
+
+    private var windowSettings: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            SettingsCard(
+                title: "Snap Zones",
+                titleIcon: "rectangle.split.3x1.fill",
+                description: "Hold the modifier while dragging a window to snap it."
+            ) {
+                SettingRow(
+                    icon: "keyboard",
+                    iconTint: .teal,
+                    title: "Snap modifier",
+                    description: "Pick a modifier that doesn't conflict with your workflow."
+                ) {
+                    ForgeSegmentedPicker(
+                        selection: $settings.windowSnapModifier,
+                        options: SettingsManager.SnapModifier.allCases.map {
+                            (label: $0.rawValue, value: $0)
+                        }
+                    )
+                    .frame(width: 220)
+                }
+            }
+
+            SettingsCard(
+                title: "Always On Top",
+                titleIcon: "pin.fill",
+                description: "Pinned windows show a colored border."
+            ) {
+                SettingRow(
+                    icon: "paintbrush.fill",
+                    iconTint: .red,
+                    title: "Border color",
+                    description: "Visible accent for any window kept on top."
+                ) {
+                    ColorPicker("", selection: .constant(ForgeTheme.Colors.accent))
+                        .labelsHidden()
+                }
+            }
+        }
+    }
+
+    // MARK: - Menu Bar
+
+    private var menuBarSettings: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            SettingsCard(
+                title: "Menu Bar Icon",
+                titleIcon: "face.smiling",
+                description: "Pick any emoji to replace the default hammer in the menu bar. Press Ctrl + ⌘ + Space inside the field for the emoji picker."
+            ) {
+                MenuBarEmojiEditor(settings: settings)
+            }
+
+            SettingsCard(
+                title: "Build your menu bar",
+                titleIcon: "menubar.rectangle",
+                description: "Mix and match tokens — date, event, countdown, progress bars, clock — in any combo."
+            ) {
+                MenuBarTokenGrid(settings: settings)
+            }
+
+            SettingsCard(
+                title: "Time format",
+                titleIcon: "clock.fill",
+                description: "Used by the Time and World Clock tokens. Standard NSDateFormatter syntax."
+            ) {
+                MenuBarFormatEditor(settings: settings)
+            }
+
+            SettingsCard(
+                title: "Separator",
+                titleIcon: "ellipsis"
+            ) {
+                MenuBarSeparatorEditor(settings: settings)
+            }
+        }
+    }
+
+    // MARK: - Shortcuts
+
+    private var shortcutsSettings: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            SettingsCard(
+                title: "Global Shortcuts",
+                titleIcon: "keyboard.fill",
+                description: "Click a binding to record a new combo. Press Escape to cancel."
+            ) {
+                VStack(spacing: 0) {
+                    ForEach(Array(ShortcutBinding.allActions.enumerated()), id: \.element.id) { index, action in
+                        if index > 0 {
+                            Divider().opacity(0.3)
+                        }
+                        ShortcutRow(
+                            actionName: action.name,
+                            actionId: action.id,
+                            settings: settings
+                        )
+                    }
+                }
+            }
+
+            HStack {
+                Spacer()
+                Button {
+                    settings.resetAllBindings()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.counterclockwise")
+                        Text("Reset all to defaults")
+                    }
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(ForgeTheme.Colors.accent)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(ForgeTheme.Colors.accent.opacity(0.1))
+                    .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    // MARK: - About
+
+    private var aboutSection: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            SettingsCard {
+                VStack(spacing: 18) {
+                    ZStack {
+                        Circle()
+                            .fill(ForgeTheme.Colors.accent.opacity(0.12))
+                            .frame(width: 96, height: 96)
+                        Image(systemName: "hammer.fill")
+                            .font(.system(size: 44, weight: .semibold))
+                            .foregroundColor(ForgeTheme.Colors.accent)
+                    }
+
+                    VStack(spacing: 6) {
+                        HStack(spacing: 8) {
+                            Text("Forge")
+                                .font(.system(size: 26, weight: .bold))
+                            Text("v1.0.0")
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(ForgeTheme.Colors.accent.opacity(0.15))
+                                .foregroundColor(ForgeTheme.Colors.accent)
+                                .clipShape(Capsule())
+                        }
+                        Text("Your desktop. Supercharged.")
+                            .font(.system(size: 14))
+                            .foregroundColor(.secondary)
+                    }
+
+                    Divider().opacity(0.3)
+
+                    HStack(spacing: 16) {
+                        AboutFact(icon: "lock.shield.fill", value: "Local", label: "Storage")
+                        AboutFact(icon: "eye.slash.fill", value: "Zero", label: "Telemetry")
+                        AboutFact(icon: "person.fill.xmark", value: "None", label: "Accounts")
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+            }
+        }
+    }
+}
+
+// MARK: - Top Tab Bar
+
+private struct SettingsTopTabs: View {
+    @Binding var selected: SettingsView.SettingsSection
+
+    var body: some View {
+        HStack(spacing: 4) {
+            // Forge logo (no text — squircle with white hammer)
+            ZStack {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(ForgeTheme.Colors.accent)
+                    .frame(width: 28, height: 28)
+                Image(systemName: "hammer.fill")
+                    .symbolRenderingMode(.monochrome)
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(.white)
+                    .rotationEffect(.degrees(-12))   // playful tilt — feels more "forge"
+            }
+            .padding(.trailing, 10)
+
+            // Tabs
+            ForEach(SettingsView.SettingsSection.allCases) { section in
+                TopTabButton(
+                    section: section,
+                    isSelected: selected == section,
+                    action: {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            selected = section
+                        }
+                    }
+                )
+            }
+
+            Spacer()
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 12)
+    }
+}
+
+private struct TopTabButton: View {
+    let section: SettingsView.SettingsSection
+    let isSelected: Bool
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: section.iconName)
+                    .font(.system(size: 11, weight: .semibold))
+                Text(section.rawValue)
+                    .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
+            }
+            .foregroundColor(
+                isSelected
+                    ? ForgeTheme.Colors.accent
+                    : (hovering ? .primary : .secondary)
+            )
+            .padding(.horizontal, 11)
+            .padding(.vertical, 7)
+            .background(
+                RoundedRectangle(cornerRadius: 7)
+                    .fill(
+                        isSelected
+                            ? ForgeTheme.Colors.accent.opacity(0.13)
+                            : (hovering ? Color.black.opacity(0.04) : Color.clear)
+                    )
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
+}
+
+// MARK: - Preview pane
+
+private struct SettingsPreviewPane: View {
+    let section: SettingsView.SettingsSection
+    @ObservedObject var settings: SettingsManager
+    @ObservedObject var moduleRegistry: ModuleRegistry
+    @Binding var previewIsDark: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header — just the "PREVIEW" label; previews always follow the
+            // app's actual theme (no separate sun/moon override).
+            HStack {
+                Text("Preview")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .textCase(.uppercase)
+                    .tracking(0.8)
+                Spacer()
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 18)
+            .padding(.bottom, 14)
+
+            // Per-section preview body — wrapped in a left-aligned full-
+            // width container so each preview sits flush left and spans
+            // the whole pane (no centered pills with cut edges).
+            VStack(alignment: .leading, spacing: 14) {
+                switch section {
+                case .general:    GeneralPreview(settings: settings, isDark: previewIsDark)
+                case .modules:    ModulesPreview(registry: moduleRegistry, isDark: previewIsDark)
+                case .calendar:   CalendarPreviewCard(settings: settings, isDark: previewIsDark)
+                case .windows:    WindowsPreview(isDark: previewIsDark)
+                case .menuBar:    MenuBarPreview(settings: settings, isDark: previewIsDark)
+                case .shortcuts:  ShortcutsPreview(settings: settings, isDark: previewIsDark)
+                case .about:      AboutPreview(isDark: previewIsDark)
+                }
+            }
+            .padding(.horizontal, 18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .transition(.opacity)
+            .animation(.easeOut(duration: 0.15), value: section)
+
+            Spacer()
+
+            Text("Changes apply instantly")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+                .padding(.bottom, 14)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+}
+
+// MARK: - Per-section preview cards
+
+/// Common card wrapper for the preview content. Uses the adaptive
+/// `surfaceCard` token so it stays visually consistent with the rest of the
+/// Settings window regardless of the preview's sun/moon toggle.
+private struct PreviewCard<Content: View>: View {
+    let isDark: Bool
+    @ViewBuilder var content: () -> Content
+    var body: some View {
+        content()
+            .frame(width: 280)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(ForgeTheme.Colors.surfaceCard)
+                    .shadow(color: .black.opacity(0.10), radius: 18, y: 6)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(ForgeTheme.Colors.borderDefault, lineWidth: 1)
+            )
+    }
+}
+
+private struct GeneralPreview: View {
+    @ObservedObject var settings: SettingsManager
+    let isDark: Bool
+    var body: some View {
+        PreviewCard(isDark: isDark) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("APPEARANCE")
+                    .font(.system(size: 9, weight: .semibold))
+                    .tracking(0.7)
+                    .foregroundColor(.secondary)
+                HStack {
+                    Text("Theme")
+                        .font(.system(size: 11))
+                        .foregroundColor(isDark ? .white : .primary)
+                    Spacer()
+                    Text(settings.theme.rawValue)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(ForgeTheme.Colors.accent)
+                }
+                Divider().opacity(0.2)
+                HStack {
+                    Text("24-hour time")
+                        .font(.system(size: 11))
+                        .foregroundColor(isDark ? .white : .primary)
+                    Spacer()
+                    Text(settings.use24HourTime ? "On" : "Off")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(settings.use24HourTime ? ForgeTheme.Colors.accent : .secondary)
+                }
+            }
+            .padding(16)
+        }
+    }
+}
+
+private struct ModulesPreview: View {
+    @ObservedObject var registry: ModuleRegistry
+    let isDark: Bool
+    var body: some View {
+        let enabled = registry.modules.filter { registry.isEnabled($0.id) }.count
+        let total = registry.modules.count
+        return PreviewCard(isDark: isDark) {
+            VStack(spacing: 14) {
+                HStack(spacing: 0) {
+                    statBlock(value: "\(enabled)", label: "Active", tint: ForgeTheme.Colors.accent)
+                    Divider().frame(height: 36).opacity(0.2)
+                    statBlock(value: "\(total - enabled)", label: "Off", tint: .secondary)
+                    Divider().frame(height: 36).opacity(0.2)
+                    statBlock(value: "\(total)", label: "Total", tint: .blue)
+                }
+                Divider().opacity(0.2)
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(registry.modules.prefix(4), id: \.id) { module in
+                        HStack(spacing: 8) {
+                            Image(systemName: module.iconName)
+                                .font(.system(size: 10))
+                                .foregroundColor(registry.isEnabled(module.id) ? ForgeTheme.Colors.accent : .secondary)
+                                .frame(width: 16)
+                            Text(module.name)
+                                .font(.system(size: 11))
+                                .foregroundColor(isDark ? .white : .primary)
+                            Spacer()
+                            Circle()
+                                .fill(registry.isEnabled(module.id) ? ForgeTheme.Colors.accent : Color.gray.opacity(0.3))
+                                .frame(width: 6, height: 6)
+                        }
+                    }
+                }
+            }
+            .padding(16)
+        }
+    }
+    private func statBlock(value: String, label: String, tint: Color) -> some View {
+        VStack(spacing: 2) {
+            Text(value).font(.system(size: 20, weight: .bold, design: .rounded)).foregroundColor(tint)
+            Text(label.uppercased()).font(.system(size: 9, weight: .semibold))
+                .tracking(0.5).foregroundColor(.secondary)
+        }.frame(maxWidth: .infinity)
+    }
+}
+
+private struct CalendarPreviewCard: View {
+    @ObservedObject var settings: SettingsManager
+    let isDark: Bool
+    var body: some View {
+        VStack(spacing: 8) {
+            // Mini menu bar
+            HStack(spacing: 6) {
+                if settings.menuBarEmoji.isEmpty {
+                    Image(systemName: "hammer.fill")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(isDark ? .white : .primary)
+                } else {
+                    Text(settings.menuBarEmoji).font(.system(size: 11))
+                }
+                Text(menuBarText)
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundColor(isDark ? .white : .primary)
+            }
+            .padding(.horizontal, 10).padding(.vertical, 4)
+            .background(Capsule().fill(isDark ? Color.black.opacity(0.6) : Color.white)
+                .shadow(color: .black.opacity(0.08), radius: 4, y: 1))
+
+            PreviewCard(isDark: isDark) {
+                MiniCalendarPreview(settings: settings, isDark: isDark)
+            }
+        }
+    }
+    private var menuBarText: String {
+        let f = DateFormatter()
+        f.dateFormat = settings.use24HourTime ? "EEE, d MMM · HH:mm" : "EEE, d MMM · h:mm a"
+        return f.string(from: Date())
+    }
+}
+
+private struct CommandBarPreview: View {
+    @ObservedObject var settings: SettingsManager
+    let isDark: Bool
+    var body: some View {
+        PreviewCard(isDark: isDark) {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundColor(.secondary)
+                    Text("Type a command…")
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Text(settings.binding(for: "commandPalette").displayString)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Capsule().fill(Color.black.opacity(0.05)))
+                }
+                .font(.system(size: 12))
+                .padding(.horizontal, 14).padding(.vertical, 12)
+
+                Divider().opacity(0.15)
+                ForEach(["Copy today's agenda", "Open Color Picker", "Window: snap left"], id: \.self) { item in
+                    HStack {
+                        Text(item).font(.system(size: 11)).foregroundColor(isDark ? .white : .primary)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                }
+            }
+        }
+    }
+}
+
+private struct WindowsPreview: View {
+    let isDark: Bool
+    var body: some View {
+        PreviewCard(isDark: isDark) {
+            VStack(spacing: 8) {
+                Text("Snap Zones — Two Columns")
+                    .font(.system(size: 10, weight: .semibold))
+                    .tracking(0.4)
+                    .foregroundColor(.secondary)
+                HStack(spacing: 6) {
+                    zoneRect()
+                    zoneRect()
+                }
+                .frame(height: 110)
+            }.padding(14)
+        }
+    }
+    private func zoneRect() -> some View {
+        RoundedRectangle(cornerRadius: 8)
+            .fill(ForgeTheme.Colors.accent.opacity(0.12))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(ForgeTheme.Colors.accent.opacity(0.5),
+                            style: StrokeStyle(lineWidth: 1, dash: [4]))
+            )
+    }
+}
+
+private struct MenuBarPreview: View {
+    @ObservedObject var settings: SettingsManager
+    let isDark: Bool
+    var body: some View {
+        // Left-aligned, full-width preview card. Content inside the pill
+        // can wrap to a second line via lineLimit(nil) so a wide token list
+        // never gets clipped at the right edge.
+        VStack(alignment: .leading, spacing: 10) {
+            Text("MENU BAR")
+                .font(.system(size: 9, weight: .semibold))
+                .tracking(0.7)
+                .foregroundColor(.secondary)
+
+            HStack(spacing: 6) {
+                if settings.menuBarEmoji.isEmpty {
+                    Image(systemName: "hammer.fill")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(ForgeTheme.Colors.accent)
+                } else {
+                    Text(settings.menuBarEmoji).font(.system(size: 13))
+                }
+                Text(tokenLine)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundColor(isDark ? .white : .primary)
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 18)
+                    .fill(isDark ? Color.black.opacity(0.6) : Color.white)
+                    .shadow(color: .black.opacity(0.1), radius: 6, y: 2)
+            )
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// All non-icon tokens joined with the user's chosen separator —
+    /// rendered as a single Text so the line can wrap cleanly.
+    private var tokenLine: String {
+        settings.menuBarTokens
+            .filter { $0 != .icon }
+            .map { tokenSample($0) }
+            .filter { !$0.isEmpty }
+            .joined(separator: settings.menuBarSeparator)
+    }
+    private func tokenSample(_ token: SettingsManager.MenuBarToken) -> String {
+        let now = Date()
+        switch token {
+        case .icon:         return ""
+        case .date:         let f = DateFormatter(); f.dateFormat = "EEE, MMM d"; return f.string(from: now)
+        case .clock:        let f = DateFormatter(); f.dateFormat = settings.menuBarTimeFormat; return f.string(from: now)
+        case .nextEvent:    return "Standup · 12m"
+        case .countdown:    return "12m"
+        case .weekNumber:
+            var c = Calendar(identifier: .iso8601)
+            c.firstWeekday = settings.weekStartsOnMonday ? 2 : 1
+            return "W\(c.component(.weekOfYear, from: now))"
+        case .dayProgress:  return "57%"
+        case .yearProgress: return "32%"
+        case .worldClock:   return "STK 14:34"
+        case .timeLeft:     return "23m left"
+        case .eventsLeft:   return "3 left"
+        case .focusTime:    return "2h focus"
+        }
+    }
+}
+
+private struct ShortcutsPreview: View {
+    @ObservedObject var settings: SettingsManager
+    let isDark: Bool
+    var body: some View {
+        PreviewCard(isDark: isDark) {
+            VStack(spacing: 8) {
+                ForEach(ShortcutBinding.allActions.prefix(5), id: \.id) { action in
+                    HStack {
+                        Text(action.name)
+                            .font(.system(size: 11))
+                            .foregroundColor(isDark ? .white : .primary)
+                        Spacer()
+                        Text(settings.binding(for: action.id).displayString)
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Capsule().fill(Color.black.opacity(0.05)))
+                    }
+                }
+            }.padding(14)
+        }
+    }
+}
+
+private struct AboutPreview: View {
+    let isDark: Bool
+    var body: some View {
+        PreviewCard(isDark: isDark) {
+            VStack(spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(ForgeTheme.Colors.accent)
+                        .frame(width: 60, height: 60)
+                    Image(systemName: "hammer.fill")
+                        .font(.system(size: 28, weight: .bold))
+                        .foregroundColor(.white)
+                        .rotationEffect(.degrees(-12))
+                }
+                Text("Forge").font(.system(size: 16, weight: .bold))
+                    .foregroundColor(isDark ? .white : .primary)
+                Text("v1.0.0").font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
+            }.padding(.vertical, 20).padding(.horizontal, 14)
+        }
+    }
+}
+
+private struct PreviewModeChip: View {
+    let icon: String
+    let isOn: Bool
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(isOn ? ForgeTheme.Colors.accent : .secondary)
+                .frame(width: 26, height: 22)
+                .background(isOn ? Color.white : Color.clear)
+                .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct MiniCalendarPreview: View {
+    @ObservedObject var settings: SettingsManager
+    let isDark: Bool
+
+    private var fg: Color { isDark ? .white : Color(white: 0.1) }
+    private var fgMuted: Color { isDark ? Color.white.opacity(0.5) : Color(white: 0.45) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // Progress strips
+            if settings.showYearProgress {
+                miniProgressRow(label: "\(Int(yearProgress * 100))% of \(yearString)",
+                                value: yearProgress)
+            }
+            if settings.showDayProgress {
+                miniProgressRow(label: "\(Int(dayProgress * 100))% of today",
+                                value: dayProgress)
+            }
+
+            // Month label
+            Text(monthString)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(fg)
+                .padding(.top, 2)
+
+            // Day headers
+            let headers = settings.weekStartsOnMonday
+                ? ["M","T","W","T","F","S","S"]
+                : ["S","M","T","W","T","F","S"]
+            HStack(spacing: 0) {
+                ForEach(Array(headers.enumerated()), id: \.offset) { idx, d in
+                    Text(d)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(isWeekendIdx(idx) && settings.dimWeekends ? fgMuted.opacity(0.6) : fgMuted)
+                        .frame(maxWidth: .infinity)
+                }
+            }
+
+            // Sample week with today highlighted
+            HStack(spacing: 0) {
+                ForEach(0..<7, id: \.self) { idx in
+                    let day = sampleDay(idx)
+                    let isToday = idx == 3
+                    ZStack {
+                        if isToday && settings.highlightToday {
+                            RoundedRectangle(cornerRadius: 5)
+                                .fill(ForgeTheme.Colors.accent)
+                                .frame(width: 22, height: 22)
+                        }
+                        Text(day)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(isToday && settings.highlightToday
+                                             ? .white
+                                             : (isWeekendIdx(idx) && settings.dimWeekends ? fgMuted : fg))
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+            }
+            .padding(.vertical, 2)
+
+            // World clock — single horizontal row, compact (matches popover).
+            // Limited to 2 cities in the preview so labels never wrap inside
+            // the narrow 280pt preview pane.
+            if settings.showWorldClock && !settings.worldClockCities.isEmpty {
+                Divider().opacity(0.2).padding(.vertical, 4)
+                HStack(spacing: 10) {
+                    ForEach(settings.worldClockCities.prefix(2)) { city in
+                        HStack(spacing: 3) {
+                            Text(city.label)
+                                .font(.system(size: 9, weight: .medium))
+                                .foregroundColor(fgMuted)
+                                .lineLimit(1)
+                            Text(timeInZone(city.timeZone))
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .foregroundColor(fg.opacity(0.85))
+                                .lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+        .padding(16)
+    }
+
+    private func miniProgressRow(label: String, value: Double) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label)
+                .font(.system(size: 9, weight: .medium))
+                .foregroundColor(fgMuted)
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(fgMuted.opacity(0.2)).frame(height: 2)
+                    Capsule().fill(ForgeTheme.Colors.accent)
+                        .frame(width: max(2, geo.size.width * value), height: 2)
+                }
+            }
+            .frame(height: 2)
+        }
+    }
+
+    private func isWeekendIdx(_ i: Int) -> Bool {
+        settings.weekStartsOnMonday ? (i == 5 || i == 6) : (i == 0 || i == 6)
+    }
+
+    private func sampleDay(_ idx: Int) -> String {
+        // Just numbers 10..16 for a representative week
+        "\(10 + idx)"
+    }
+
+    private var yearProgress: Double {
+        let now = Date()
+        let cal = Calendar.current
+        let year = cal.component(.year, from: now)
+        let start = cal.date(from: DateComponents(year: year, month: 1, day: 1))!
+        let next  = cal.date(from: DateComponents(year: year + 1, month: 1, day: 1))!
+        return now.timeIntervalSince(start) / next.timeIntervalSince(start)
+    }
+    private var dayProgress: Double {
+        let cal = Calendar.current
+        let now = Date()
+        return now.timeIntervalSince(cal.startOfDay(for: now)) / 86400.0
+    }
+    private var yearString: String { "\(Calendar.current.component(.year, from: Date()))" }
+    private var monthString: String {
+        let f = DateFormatter(); f.dateFormat = "MMM yyyy"
+        return f.string(from: Date())
+    }
+    private func timeInZone(_ tz: TimeZone) -> String {
+        let f = DateFormatter()
+        f.timeZone = tz
+        f.dateFormat = settings.use24HourTime ? "HH:mm" : "h:mm a"
+        return f.string(from: Date())
+    }
+}
+
+// MARK: - Segmented Picker (Forge red accent)
+
+/// Drop-in replacement for SwiftUI's `.pickerStyle(.segmented)` that uses
+/// the Forge accent (vermillion red) for the selected segment instead of
+/// the system gray. Pass a list of `(label, tag)` options and a binding.
+private struct ForgeSegmentedPicker<Value: Hashable>: View {
+    @Binding var selection: Value
+    let options: [(label: String, value: Value)]
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(options.indices, id: \.self) { idx in
+                let item = options[idx]
+                let isSelected = selection == item.value
+                Button {
+                    withAnimation(ForgeTheme.Animation.smooth) {
+                        selection = item.value
+                    }
+                } label: {
+                    Text(item.label)
+                        .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
+                        .foregroundColor(isSelected
+                                         ? .white
+                                         : ForgeTheme.Colors.textSecondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 5)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(isSelected
+                                      ? ForgeTheme.Colors.accent
+                                      : Color.clear)
+                                .padding(2)
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(2)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(ForgeTheme.Colors.surfaceInput.opacity(0.6))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(ForgeTheme.Colors.borderDefault, lineWidth: 0.5)
+        )
+    }
+}
+
+// MARK: - Hero
+
+private struct SectionHero: View {
+    let title: String
+    let subtitle: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.system(size: 28, weight: .bold))
+                .foregroundColor(.primary)
+            if let subtitle = subtitle {
+                Text(subtitle)
+                    .font(.system(size: 13))
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+}
+
+// MARK: - Card
+
+private struct SettingsCard<Content: View>: View {
+    var title: String? = nil
+    var titleIcon: String? = nil
+    var description: String? = nil
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if title != nil || description != nil {
+                VStack(alignment: .leading, spacing: 3) {
+                    if let title = title {
+                        HStack(spacing: 7) {
+                            if let icon = titleIcon {
+                                Image(systemName: icon)
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundColor(ForgeTheme.Colors.accent)
+                            }
+                            Text(title)
+                                .font(.system(size: 15, weight: .semibold))
+                        }
+                    }
+                    if let description = description {
+                        Text(description)
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+            content()
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(ForgeTheme.Colors.surfaceCard)
+                .shadow(color: .black.opacity(0.06), radius: 2, y: 1)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(ForgeTheme.Colors.borderDefault, lineWidth: 1)
+        )
+    }
+}
+
+// MARK: - Setting Row
+
+private struct SettingRow<Control: View>: View {
+    var icon: String? = nil
+    var iconTint: Color = ForgeTheme.Colors.accent
+    let title: String
+    var description: String? = nil
+    @ViewBuilder var control: () -> Control
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            if let icon = icon {
+                Image(systemName: icon)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(iconTint)
+                    .frame(width: 28, height: 28)
+                    .background(iconTint.opacity(0.14))
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 13, weight: .medium))
+                if let description = description {
+                    Text(description)
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+            }
+            Spacer(minLength: 12)
+            control()
+        }
+    }
+}
+
+// MARK: - Modules card row
+
+private struct ModuleRowSetting: View {
+    let module: any ForgeModule
+    @ObservedObject var registry: ModuleRegistry
+    @EnvironmentObject var settings: SettingsManager
+
+    var body: some View {
+        let enabled = registry.isEnabled(module.id)
+        let shortcut = shortcutForModule(id: module.id)
+        return HStack(alignment: .center, spacing: 10) {
+            Image(systemName: module.iconName)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(enabled ? ForgeTheme.Colors.accent : .secondary)
+                .frame(width: 24, height: 24)
+                .background((enabled ? ForgeTheme.Colors.accent : Color.gray).opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            Text(module.name)
+                .font(.system(size: 12, weight: .medium))
+
+            if let shortcut = shortcut {
+                Text(shortcut)
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(RoundedRectangle(cornerRadius: 3).fill(ForgeTheme.Colors.borderSubtle))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 3)
+                            .stroke(ForgeTheme.Colors.borderDefault, lineWidth: 0.5)
+                    )
+            }
+
+            Spacer()
+
+            Toggle("", isOn: Binding(
+                get: { registry.isEnabled(module.id) },
+                set: { _ in registry.toggleModule(module.id) }
+            ))
+            .toggleStyle(.forge)
+            .labelsHidden()
+            .tint(ForgeTheme.Colors.accent)
+            .controlSize(.small)
+        }
+        .padding(.vertical, 5)
+    }
+
+    private func shortcutForModule(id: String) -> String? {
+        let bindingId: String?
+        switch id {
+        case "commandPalette":     bindingId = "commandPalette"
+        case "colorPicker":        bindingId = "colorPicker"
+        case "screenRuler":        bindingId = "screenRuler"
+        case "textExtractor":      bindingId = "textExtractor"
+        case "zoomIt":             bindingId = "zoomIt"
+        case "fancyZones":         bindingId = "fancyZones"
+        case "windowManager":      bindingId = "alwaysOnTop"
+        case "meetingReminder":    bindingId = "joinMeeting"
+        case "screenshotAnnotate": bindingId = "screenshot"
+        case "mouseHighlight":     bindingId = "mouseHighlight"
+        default:                   bindingId = nil
+        }
+        guard let id = bindingId else { return nil }
+        let s = settings.binding(for: id).displayString
+        return s.isEmpty ? nil : s
+    }
+}
+
+// MARK: - Building blocks
+
+private struct ShortcutPill: View {
+    let text: String
+    var body: some View {
+        Text(text)
+            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(Color.black.opacity(0.05))
+            .overlay(
+                RoundedRectangle(cornerRadius: 5)
+                    .stroke(Color.black.opacity(0.08), lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 5))
+    }
+}
+
+private struct StatPill: View {
+    let value: String
+    let label: String
+    let tint: Color
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(value)
+                .font(.system(size: 22, weight: .bold, design: .rounded))
+                .foregroundColor(tint)
+            Text(label.uppercased())
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundColor(.secondary)
+                .tracking(0.5)
+        }
+    }
+}
+
+private struct TokenRow: View {
+    let title: String
+    let active: Bool
+    let action: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: active ? "line.3.horizontal" : "circle.dashed")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+            Text(title)
+                .font(.system(size: 13, weight: active ? .medium : .regular))
+                .foregroundColor(active ? .primary : .secondary)
+            Spacer()
+            Button(action: action) {
+                Image(systemName: active ? "minus.circle.fill" : "plus.circle.fill")
+                    .font(.system(size: 14))
+                    .foregroundColor(active ? .secondary : ForgeTheme.Colors.accent)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color.black.opacity(active ? 0.03 : 0.0))
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+    }
+}
+
+// MARK: - Menu Bar Token Grid (Dot-style click-to-toggle chips)
+
+private struct MenuBarTokenGrid: View {
+    @ObservedObject var settings: SettingsManager
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            // Live preview row
+            HStack(spacing: 6) {
+                if settings.menuBarTokens.contains(.icon) {
+                    if settings.menuBarEmoji.isEmpty {
+                        Image(systemName: "hammer.fill")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundColor(.primary)
+                    } else {
+                        Text(settings.menuBarEmoji).font(.system(size: 13))
+                    }
+                }
+                Text(previewText)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+                Spacer()
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color.black.opacity(0.04))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.black.opacity(0.08), lineWidth: 1)
+            )
+
+            // Chip grid — width measured by GeometryReader and explicitly
+            // passed to FlowLayout so chips reliably wrap to a new row.
+            WrappingChipGrid(settings: settings, toggle: toggle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text("Click tokens to add or remove them")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private func toggle(_ token: SettingsManager.MenuBarToken) {
+        if let idx = settings.menuBarTokens.firstIndex(of: token) {
+            settings.menuBarTokens.remove(at: idx)
+        } else {
+            settings.menuBarTokens.append(token)
+        }
+    }
+
+    /// Approximation of what the menu bar will render (for the preview row).
+    private var previewText: String {
+        let now = Date()
+        let fmt = DateFormatter()
+        var parts: [String] = []
+        for token in settings.menuBarTokens where token != .icon {
+            switch token {
+            case .date:
+                fmt.dateFormat = "EEE, MMM d"
+                parts.append(fmt.string(from: now))
+            case .clock:
+                fmt.dateFormat = settings.menuBarTimeFormat
+                parts.append(fmt.string(from: now))
+            case .nextEvent:    parts.append("Standup · 12m")
+            case .countdown:    parts.append("12m")
+            case .weekNumber:
+                var c = Calendar(identifier: .iso8601)
+                c.firstWeekday = settings.weekStartsOnMonday ? 2 : 1
+                parts.append("W\(c.component(.weekOfYear, from: now))")
+            case .dayProgress:  parts.append("57%")
+            case .yearProgress: parts.append("32% of \(Calendar.current.component(.year, from: now))")
+            case .worldClock:
+                if let city = settings.worldClockCities.first(where: { !$0.isLocal }) {
+                    fmt.timeZone = city.timeZone
+                    fmt.dateFormat = settings.menuBarTimeFormat
+                    parts.append("\(String(city.label.prefix(3)).uppercased()) \(fmt.string(from: now))")
+                }
+            case .timeLeft:     parts.append("23m left")
+            case .eventsLeft:   parts.append("3 left")
+            case .focusTime:    parts.append("2h focus")
+            case .icon: break
+            }
+        }
+        return parts.joined(separator: settings.menuBarSeparator)
+    }
+}
+
+private struct TokenChip: View {
+    let title: String
+    let active: Bool
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(active ? .white : (hovering ? .primary : .secondary))
+                .padding(.horizontal, 11)
+                .padding(.vertical, 6)
+                .background(
+                    Capsule().fill(
+                        active
+                            ? Color(white: 0.15)
+                            : (hovering ? Color.black.opacity(0.05) : Color.clear)
+                    )
+                )
+                .overlay(
+                    Capsule().stroke(
+                        active ? Color.clear : Color.black.opacity(0.10),
+                        lineWidth: 1
+                    )
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
+}
+
+/// Chip grid wrapper that measures its width via `GeometryReader` and feeds
+/// it to `FlowLayout` as an explicit `maxWidth`, plus tracks the natural
+/// wrapped height via a `PreferenceKey` so the parent stack reserves the
+/// right vertical space.
+private struct WrappingChipGrid: View {
+    @ObservedObject var settings: SettingsManager
+    let toggle: (SettingsManager.MenuBarToken) -> Void
+
+    @State private var availableWidth: CGFloat = 0
+    @State private var contentHeight: CGFloat = 0
+
+    var body: some View {
+        GeometryReader { geo in
+            FlowLayout(spacing: 6, maxWidth: geo.size.width) {
+                ForEach(SettingsManager.MenuBarToken.allCases) { token in
+                    TokenChip(
+                        title: token.displayName,
+                        active: settings.menuBarTokens.contains(token),
+                        action: { toggle(token) }
+                    )
+                }
+            }
+            .background(
+                GeometryReader { inner in
+                    Color.clear.preference(
+                        key: ChipGridHeightKey.self,
+                        value: inner.size.height
+                    )
+                }
+            )
+            .onAppear { availableWidth = geo.size.width }
+            .onChange(of: geo.size.width) { _, newValue in
+                availableWidth = newValue
+            }
+        }
+        .frame(height: max(contentHeight, 36))
+        .onPreferenceChange(ChipGridHeightKey.self) { contentHeight = $0 }
+    }
+}
+
+private struct ChipGridHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+// Lightweight flow layout for chips. Takes an explicit `maxWidth` (driven
+// from a GeometryReader at the call-site) so wrapping always works even when
+// the parent passes a `nil` / unspecified width proposal — that's what was
+// causing the "Time Left" chip to overflow past the card's right edge.
+private struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+    var maxWidth: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let cap = max(maxWidth, 1)
+        var x: CGFloat = 0, y: CGFloat = 0, rowHeight: CGFloat = 0
+        for sub in subviews {
+            let size = sub.sizeThatFits(.unspecified)
+            if x + size.width > cap, x > 0 {
+                x = 0; y += rowHeight + spacing; rowHeight = 0
+            }
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+        return CGSize(width: cap, height: y + rowHeight)
+    }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x: CGFloat = bounds.minX, y: CGFloat = bounds.minY, rowHeight: CGFloat = 0
+        for sub in subviews {
+            let size = sub.sizeThatFits(.unspecified)
+            if x + size.width > bounds.maxX, x > bounds.minX {
+                x = bounds.minX; y += rowHeight + spacing; rowHeight = 0
+            }
+            sub.place(at: CGPoint(x: x, y: y), anchor: .topLeading, proposal: .unspecified)
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+    }
+}
+
+// MARK: - Menu Bar format & separator editors
+
+// MARK: - Menu Bar Emoji Editor
+
+/// Lets the user pick a single emoji that replaces the hammer SF Symbol in
+/// the menu bar (and every place the hammer appears in the UI / previews).
+private struct MenuBarEmojiEditor: View {
+    @ObservedObject var settings: SettingsManager
+    @FocusState private var emojiFieldFocused: Bool
+
+    /// Quick-pick row — common productivity icons. Click to set.
+    private let quickPicks: [String] = ["🔨", "⚒️", "🛠️", "⚡", "🚀", "🔥",
+                                        "🎯", "💼", "📅", "⏰", "🗓️", "✨",
+                                        "🌟", "🧠", "💡", "🍅"]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            // Top row: preview tile + text field + reset
+            HStack(spacing: 14) {
+                // Big preview tile showing what'll appear in the menu bar
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(ForgeTheme.Colors.surfaceInput)
+                        .frame(width: 56, height: 56)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(ForgeTheme.Colors.borderDefault, lineWidth: 1)
+                        )
+
+                    if settings.menuBarEmoji.isEmpty {
+                        Image(systemName: "hammer.fill")
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundColor(ForgeTheme.Colors.accent)
+                    } else {
+                        Text(settings.menuBarEmoji)
+                            .font(.system(size: 30))
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        TextField("Type or paste an emoji", text: Binding(
+                            get: { settings.menuBarEmoji },
+                            set: { newValue in
+                                // Keep just the first grapheme cluster — so
+                                // "🔨🚀" or "🔨 hello" collapses to "🔨".
+                                settings.menuBarEmoji = String(newValue.prefix(1))
+                            }
+                        ))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 18))
+                        .frame(width: 140)
+                        .focused($emojiFieldFocused)
+
+                        Button {
+                            emojiFieldFocused = true
+                            // Open the system emoji & symbols palette. The
+                            // user picks a glyph; it lands in the focused
+                            // field via the system IME.
+                            NSApp.orderFrontCharacterPalette(nil)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "face.smiling")
+                                Text("Open emoji picker")
+                            }
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(ForgeTheme.Colors.accent)
+                            .padding(.horizontal, 10).padding(.vertical, 6)
+                            .background(ForgeTheme.Colors.accent.opacity(0.12))
+                            .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+
+                        if !settings.menuBarEmoji.isEmpty {
+                            Button {
+                                settings.menuBarEmoji = ""
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.counterclockwise")
+                                    Text("Reset")
+                                }
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Use the default hammer icon")
+                        }
+                    }
+
+                    Text(settings.menuBarEmoji.isEmpty
+                         ? "Currently using the default hammer."
+                         : "Live in your menu bar.")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer()
+            }
+
+            Divider().opacity(0.3)
+
+            // Quick picks
+            VStack(alignment: .leading, spacing: 6) {
+                Text("QUICK PICKS")
+                    .font(.system(size: 9, weight: .semibold))
+                    .tracking(0.7)
+                    .foregroundColor(.secondary)
+
+                HStack(spacing: 8) {
+                    ForEach(quickPicks, id: \.self) { emoji in
+                        Button {
+                            settings.menuBarEmoji = emoji
+                        } label: {
+                            Text(emoji)
+                                .font(.system(size: 20))
+                                .frame(width: 32, height: 32)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 7)
+                                        .fill(settings.menuBarEmoji == emoji
+                                              ? ForgeTheme.Colors.accent.opacity(0.15)
+                                              : Color.black.opacity(0.04))
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 7)
+                                        .stroke(settings.menuBarEmoji == emoji
+                                                ? ForgeTheme.Colors.accent.opacity(0.6)
+                                                : Color.clear,
+                                                lineWidth: 1.5)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .help("Use \(emoji)")
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+    }
+}
+
+private struct MenuBarFormatEditor: View {
+    @ObservedObject var settings: SettingsManager
+    private let presets = ["HH:mm", "h:mm a", "HH:mm:ss", "yyyy-MM-dd"]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                TextField("HH:mm", text: $settings.menuBarTimeFormat)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 160)
+                    .font(.system(size: 12, design: .monospaced))
+
+                Text(formattedNow)
+                    .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                    .foregroundColor(ForgeTheme.Colors.accent)
+                Spacer()
+            }
+
+            HStack(spacing: 6) {
+                ForEach(presets, id: \.self) { preset in
+                    Button {
+                        settings.menuBarTimeFormat = preset
+                    } label: {
+                        Text(preset)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(settings.menuBarTimeFormat == preset ? .white : .secondary)
+                            .padding(.horizontal, 9).padding(.vertical, 5)
+                            .background(
+                                Capsule().fill(
+                                    settings.menuBarTimeFormat == preset
+                                        ? Color(white: 0.15)
+                                        : Color.black.opacity(0.04)
+                                )
+                            )
+                            .overlay(
+                                Capsule().stroke(
+                                    settings.menuBarTimeFormat == preset
+                                        ? Color.clear
+                                        : Color.black.opacity(0.08),
+                                    lineWidth: 1)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private var formattedNow: String {
+        let f = DateFormatter()
+        f.dateFormat = settings.menuBarTimeFormat
+        return f.string(from: Date())
+    }
+}
+
+private struct MenuBarSeparatorEditor: View {
+    @ObservedObject var settings: SettingsManager
+    private let presets: [(label: String, value: String)] = [
+        ("|",     " | "),
+        ("·",     " · "),
+        ("—",     " — "),
+        ("space", "  "),
+    ]
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(presets, id: \.value) { p in
+                Button {
+                    settings.menuBarSeparator = p.value
+                } label: {
+                    Text(p.label)
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                        .foregroundColor(settings.menuBarSeparator == p.value ? .white : .secondary)
+                        .frame(minWidth: 44, minHeight: 28)
+                        .background(
+                            RoundedRectangle(cornerRadius: 7).fill(
+                                settings.menuBarSeparator == p.value
+                                    ? Color(white: 0.15)
+                                    : Color.black.opacity(0.04)
+                            )
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 7).stroke(
+                                settings.menuBarSeparator == p.value
+                                    ? Color.clear
+                                    : Color.black.opacity(0.08),
+                                lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer()
+        }
+    }
+}
+
+// MARK: - Google Calendar Accounts Editor (native OAuth)
+
+private struct GoogleAccountsEditor: View {
+    @ObservedObject private var service = GoogleCalendarService.shared
+    @State private var showAdvanced = false
+    @State private var clientIDDraft: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // Connected accounts
+            if service.accounts.isEmpty {
+                HStack {
+                    Image(systemName: "person.crop.circle.badge.questionmark")
+                        .foregroundColor(.secondary)
+                    Text("No Google accounts connected yet.")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                    Spacer()
+                }
+                .padding(.vertical, 6)
+            } else {
+                VStack(spacing: 6) {
+                    ForEach(service.accounts) { account in
+                        GoogleAccountRow(account: account)
+                    }
+                }
+            }
+
+            // Connect button (uses bundled client ID — user never sees one)
+            HStack(spacing: 10) {
+                Button { service.connect() } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "person.crop.circle.fill.badge.plus")
+                        Text(service.accounts.isEmpty
+                             ? "Connect Google account"
+                             : "Connect another account")
+                    }
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 7)
+                    .background(Capsule().fill(ForgeTheme.Colors.accent))
+                }
+                .buttonStyle(.plain)
+                Spacer()
+            }
+
+            if let err = service.lastError {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                    Text(err)
+                }
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(.orange)
+            }
+
+            // Advanced disclosure — most users never open this
+            DisclosureGroup(isExpanded: $showAdvanced) {
+                advancedClientIDEditor
+                    .padding(.top, 8)
+            } label: {
+                Text("Advanced")
+                    .font(.system(size: 10, weight: .semibold))
+                    .tracking(0.5)
+                    .foregroundColor(.secondary)
+            }
+
+            Text("Native Google events flow into the calendar live. Pick a color when you connect — every event from that account uses it.")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+                .padding(.top, 4)
+        }
+        // Color picker sheet — appears after a successful OAuth handshake.
+        .sheet(item: $service.pendingAccount) { pending in
+            GoogleColorPickerSheet(pending: pending)
+        }
+    }
+
+    private var advancedClientIDEditor: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("OAuth Client ID")
+                .font(.system(size: 10, weight: .semibold))
+                .tracking(0.5)
+                .foregroundColor(.secondary)
+            Text("Override the bundled Forge client ID with your own Google Cloud OAuth client (Desktop app type). Leave blank to use the default.")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+
+            HStack(spacing: 6) {
+                TextField(GoogleCalendarService.defaultClientID,
+                          text: $clientIDDraft)
+                    .font(.system(size: 11, design: .monospaced))
+                    .textFieldStyle(.roundedBorder)
+                    .onAppear {
+                        clientIDDraft = service.hasCustomClientID ? service.clientID : ""
+                    }
+                Button("Save") {
+                    service.clientID = clientIDDraft.trimmingCharacters(in: .whitespaces)
+                }
+                if service.hasCustomClientID {
+                    Button("Reset") {
+                        service.clientID = ""
+                        clientIDDraft = ""
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: Google account row + color picker
+
+private struct GoogleAccountRow: View {
+    let account: GoogleAccount
+    @ObservedObject private var service = GoogleCalendarService.shared
+    @State private var showPalette = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            // Colored badge — click to change color
+            Button { showPalette.toggle() } label: {
+                ZStack {
+                    Circle()
+                        .fill(Color(hex: account.colorHex))
+                        .frame(width: 24, height: 24)
+                    Image(systemName: "g.circle.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.9))
+                }
+                .overlay(Circle().stroke(Color.black.opacity(0.08), lineWidth: 0.5))
+            }
+            .buttonStyle(.plain)
+            .popover(isPresented: $showPalette, arrowEdge: .bottom) {
+                GoogleColorPalettePopover(account: account)
+            }
+            .help("Change color")
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(account.name ?? account.email)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(account.email)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+            Button {
+                service.disconnect(email: account.email)
+            } label: {
+                Image(systemName: "minus.circle.fill")
+                    .font(.system(size: 14))
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Disconnect this Google account")
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 8).fill(ForgeTheme.Colors.borderSubtle))
+    }
+}
+
+private struct GoogleColorPalettePopover: View {
+    let account: GoogleAccount
+    @ObservedObject private var service = GoogleCalendarService.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Color for \(account.email)")
+                .font(.system(size: 10, weight: .semibold))
+                .tracking(0.4)
+                .foregroundColor(.secondary)
+                .textCase(.uppercase)
+            HStack(spacing: 6) {
+                ForEach(CalendarColorPreset.allCases) { preset in
+                    Button {
+                        service.setColor(for: account.email, colorHex: preset.hex)
+                    } label: {
+                        ZStack {
+                            Circle().fill(Color(hex: preset.hex))
+                                .frame(width: 22, height: 22)
+                            if account.colorHex.uppercased() == preset.hex.uppercased() {
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundColor(.white)
+                            }
+                        }
+                        .overlay(Circle().stroke(Color.black.opacity(0.08), lineWidth: 0.5))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(14)
+        .frame(width: 280)
+    }
+}
+
+private struct GoogleColorPickerSheet: View {
+    let pending: PendingGoogleAccount
+    @ObservedObject private var service = GoogleCalendarService.shared
+    @State private var selection: String
+
+    init(pending: PendingGoogleAccount) {
+        self.pending = pending
+        _selection = State(initialValue: pending.suggestedColor)
+    }
+
+    var body: some View {
+        VStack(spacing: 18) {
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill(Color(hex: selection))
+                        .frame(width: 44, height: 44)
+                    Image(systemName: "g.circle.fill")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundColor(.white)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    if let name = pending.name {
+                        Text(name).font(.system(size: 14, weight: .semibold))
+                    }
+                    Text(pending.email)
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Pick a color for this account")
+                    .font(.system(size: 10, weight: .semibold))
+                    .tracking(0.5)
+                    .foregroundColor(.secondary)
+                    .textCase(.uppercase)
+                Text("Every event from \(pending.email) will use this color across Forge.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+
+                HStack(spacing: 8) {
+                    ForEach(CalendarColorPreset.allCases) { preset in
+                        Button { selection = preset.hex } label: {
+                            ZStack {
+                                Circle().fill(Color(hex: preset.hex))
+                                    .frame(width: 26, height: 26)
+                                if selection.uppercased() == preset.hex.uppercased() {
+                                    Image(systemName: "checkmark")
+                                        .font(.system(size: 11, weight: .bold))
+                                        .foregroundColor(.white)
+                                }
+                            }
+                            .overlay(Circle().stroke(Color.black.opacity(0.08), lineWidth: 0.5))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.top, 4)
+            }
+
+            HStack {
+                Button("Cancel") {
+                    service.cancelPendingAccount()
+                }
+                .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button {
+                    service.confirmPendingAccount(color: selection)
+                } label: {
+                    Text("Connect")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 16).padding(.vertical, 6)
+                        .background(Capsule().fill(ForgeTheme.Colors.accent))
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
+    }
+}
+
+// MARK: - Linked Calendars Editor
+
+private struct LinkedCalendarsEditor: View {
+    @ObservedObject var settings: SettingsManager
+    @ObservedObject var moduleRegistry: ModuleRegistry
+
+    /// All calendars EventKit currently knows about (from any macOS account).
+    private var availableCalendars: [CalendarSource] {
+        guard let cal = moduleRegistry.module(ofType: CalendarModule.self) else { return [] }
+        let linkedIds = Set(settings.linkedCalendars.map { $0.calendarIdentifier })
+        return cal.calendars
+            .filter { !linkedIds.contains($0.calendarIdentifier) }
+            .map { ek in
+                CalendarSource(
+                    id: ek.calendarIdentifier,
+                    title: ek.title,
+                    source: ek.source.title,
+                    nativeColorHex: hexString(from: ek.cgColor)
+                )
+            }
+    }
+
+    private var isAtLimit: Bool {
+        settings.linkedCalendars.count >= SettingsManager.maxLinkedCalendars
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // Stats header
+            HStack {
+                Text("\(settings.linkedCalendars.count) of \(SettingsManager.maxLinkedCalendars) linked")
+                    .font(.system(size: 11, weight: .semibold))
+                    .tracking(0.4)
+                    .foregroundColor(.secondary)
+                Spacer()
+                if !availableCalendars.isEmpty && !isAtLimit {
+                    addCalendarMenu
+                }
+            }
+
+            // Linked rows
+            if settings.linkedCalendars.isEmpty {
+                EmptyStateView(
+                    icon: "calendar.badge.plus",
+                    title: "No calendars linked yet",
+                    description: availableCalendars.isEmpty
+                        ? "Add an account in System Settings to get started."
+                        : "Tap “Add calendar” to link one."
+                )
+                .padding(.vertical, 8)
+            } else {
+                VStack(spacing: 6) {
+                    ForEach(settings.linkedCalendars) { linked in
+                        LinkedCalendarRow(
+                            settings: settings,
+                            linked: linked,
+                            sourceLabel: sourceLabel(for: linked)
+                        )
+                    }
+                }
+            }
+
+            Divider().opacity(0.3).padding(.top, 2)
+
+            // Account management
+            HStack(spacing: 8) {
+                Button {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Internet-Accounts-preferences")!)
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.up.right.square.fill")
+                        Text("Add account")
+                    }
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(ForgeTheme.Colors.accent)
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(ForgeTheme.Colors.accent.opacity(0.10)))
+                }
+                .buttonStyle(.plain)
+                .help("Open System Settings → Internet Accounts")
+
+                if isAtLimit {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                        Text("Max 10 calendars — remove one to link another")
+                    }
+                    .font(.system(size: 10))
+                    .foregroundColor(.orange)
+                }
+                Spacer()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var addCalendarMenu: some View {
+        Menu {
+            // Group by source title
+            let groups = Dictionary(grouping: availableCalendars) { $0.source }
+            ForEach(groups.keys.sorted(), id: \.self) { sourceName in
+                if let items = groups[sourceName] {
+                    Section(sourceName) {
+                        ForEach(items) { c in
+                            Button {
+                                link(c)
+                            } label: {
+                                HStack {
+                                    Circle().fill(Color(hex: c.nativeColorHex)).frame(width: 8, height: 8)
+                                    Text(c.title)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "plus.circle.fill")
+                Text("Add calendar")
+            }
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundColor(.white)
+            .padding(.horizontal, 11)
+            .padding(.vertical, 6)
+            .background(Capsule().fill(ForgeTheme.Colors.accent))
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+    }
+
+    private func link(_ source: CalendarSource) {
+        guard settings.linkedCalendars.count < SettingsManager.maxLinkedCalendars else { return }
+        let nextColor = CalendarColorPreset.nextUnused(in: settings.linkedCalendars).hex
+        settings.linkedCalendars.append(
+            LinkedCalendar(
+                calendarIdentifier: source.id,
+                displayName: source.title,
+                colorHex: nextColor
+            )
+        )
+    }
+
+    private func sourceLabel(for linked: LinkedCalendar) -> String {
+        guard let cal = moduleRegistry.module(ofType: CalendarModule.self)?
+                .calendars.first(where: { $0.calendarIdentifier == linked.calendarIdentifier })
+        else { return "Unavailable" }
+        return cal.source.title
+    }
+}
+
+/// Lightweight value type representing an EKCalendar entry for the picker.
+private struct CalendarSource: Identifiable {
+    let id: String          // calendarIdentifier
+    let title: String
+    let source: String      // EKSource.title
+    let nativeColorHex: String
+}
+
+private struct LinkedCalendarRow: View {
+    @ObservedObject var settings: SettingsManager
+    let linked: LinkedCalendar
+    let sourceLabel: String
+
+    @State private var editingName: String = ""
+    @State private var isEditingName: Bool = false
+    @State private var showingColorPicker: Bool = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            // Color swatch — click to change
+            Button {
+                showingColorPicker.toggle()
+            } label: {
+                Circle()
+                    .fill(Color(hex: linked.colorHex))
+                    .frame(width: 14, height: 14)
+                    .overlay(Circle().stroke(Color.black.opacity(0.1), lineWidth: 0.5))
+            }
+            .buttonStyle(.plain)
+            .popover(isPresented: $showingColorPicker, arrowEdge: .bottom) {
+                ColorPalettePopover(linked: linked, settings: settings)
+            }
+
+            // Name (editable on click)
+            if isEditingName {
+                TextField("Name", text: $editingName, onCommit: {
+                    commitNameEdit()
+                })
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12, weight: .medium))
+                .frame(maxWidth: 200)
+                .onExitCommand { isEditingName = false }
+            } else {
+                Text(linked.displayName)
+                    .font(.system(size: 12, weight: .medium))
+                    .onTapGesture {
+                        editingName = linked.displayName
+                        isEditingName = true
+                    }
+            }
+
+            Text("· \(sourceLabel)")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+
+            Spacer()
+
+            // Edit name button
+            Button {
+                editingName = linked.displayName
+                isEditingName.toggle()
+                if !isEditingName { commitNameEdit() }
+            } label: {
+                Image(systemName: "pencil")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .frame(width: 22, height: 22)
+                    .background(Circle().fill(Color.black.opacity(0.04)))
+            }
+            .buttonStyle(.plain)
+
+            // Remove
+            Button {
+                settings.linkedCalendars.removeAll { $0.id == linked.id }
+            } label: {
+                Image(systemName: "minus.circle.fill")
+                    .font(.system(size: 13))
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.black.opacity(0.03))
+        )
+    }
+
+    private func commitNameEdit() {
+        let trimmed = editingName.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { isEditingName = false; return }
+        if let idx = settings.linkedCalendars.firstIndex(where: { $0.id == linked.id }) {
+            settings.linkedCalendars[idx].displayName = trimmed
+        }
+        isEditingName = false
+    }
+}
+
+private struct ColorPalettePopover: View {
+    let linked: LinkedCalendar
+    @ObservedObject var settings: SettingsManager
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Pick a color")
+                .font(.system(size: 11, weight: .semibold))
+                .tracking(0.4)
+                .foregroundColor(.secondary)
+
+            HStack(spacing: 6) {
+                ForEach(CalendarColorPreset.allCases) { preset in
+                    Button {
+                        if let idx = settings.linkedCalendars.firstIndex(where: { $0.id == linked.id }) {
+                            settings.linkedCalendars[idx].colorHex = preset.hex
+                        }
+                    } label: {
+                        ZStack {
+                            Circle()
+                                .fill(Color(hex: preset.hex))
+                                .frame(width: 22, height: 22)
+                            if linked.colorHex.uppercased() == preset.hex.uppercased() {
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundColor(.white)
+                            }
+                        }
+                        .overlay(
+                            Circle().stroke(Color.black.opacity(0.08), lineWidth: 0.5)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(14)
+        .frame(width: 280)
+    }
+}
+
+/// Convert CGColor → hex (#RRGGBB).
+private func hexString(from cg: CGColor) -> String {
+    let comps = cg.components ?? []
+    let r = Int((comps.count > 0 ? comps[0] : 0) * 255)
+    let g = Int((comps.count > 1 ? comps[1] : 0) * 255)
+    let b = Int((comps.count > 2 ? comps[2] : 0) * 255)
+    return String(format: "#%02X%02X%02X", r, g, b)
+}
+
+// (Color(hex:) lives in ForgeTheme.swift)
+
+// MARK: - World Clock Editor
+
+private struct WorldClockEditor: View {
+    @ObservedObject var settings: SettingsManager
+
+    private var unusedPresets: [WorldClockCity] {
+        WorldClockCity.presets.filter { preset in
+            !settings.worldClockCities.contains { $0.timeZoneId == preset.timeZoneId }
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // Active cities
+            if settings.worldClockCities.isEmpty {
+                Text("No cities yet — add one below.")
+                    .font(.system(size: 12))
+                    .foregroundColor(.secondary)
+                    .padding(.vertical, 8)
+            } else {
+                ForEach(settings.worldClockCities) { city in
+                    HStack(spacing: 10) {
+                        Image(systemName: city.isLocal ? "location.circle.fill" : "globe")
+                            .font(.system(size: 12))
+                            .foregroundColor(city.isLocal ? ForgeTheme.Colors.accent : .secondary)
+                            .frame(width: 18)
+
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(city.label)
+                                .font(.system(size: 13, weight: .medium))
+                                .lineLimit(1)
+                            if !city.isLocal {
+                                Text(city.timeZoneId)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+
+                        Spacer(minLength: 8)
+
+                        // Time pill — fixed: never truncates ("19:52" needs ~38pt).
+                        Text(currentTime(in: city.timeZone))
+                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Color.black.opacity(0.04))
+                            .clipShape(Capsule())
+
+                        Button {
+                            settings.worldClockCities.removeAll { $0.id == city.id }
+                        } label: {
+                            Image(systemName: "minus.circle.fill")
+                                .font(.system(size: 14))
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Remove \(city.label)")
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(Color.black.opacity(0.03))
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                }
+            }
+
+            // Add row
+            HStack(spacing: 8) {
+                if !settings.worldClockCities.contains(where: { $0.isLocal }) {
+                    Button {
+                        settings.worldClockCities.append(
+                            WorldClockCity(label: "Local", timeZoneId: "")
+                        )
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "location.circle.fill")
+                            Text("Add Local")
+                        }
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(ForgeTheme.Colors.accent)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(ForgeTheme.Colors.accent.opacity(0.12))
+                        .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Menu {
+                    if unusedPresets.isEmpty {
+                        Text("All preset cities added")
+                    } else {
+                        ForEach(unusedPresets) { preset in
+                            Button {
+                                settings.worldClockCities.append(preset)
+                            } label: {
+                                HStack {
+                                    Text(preset.label)
+                                    Spacer()
+                                    Text(currentTime(in: preset.timeZone))
+                                        .font(.system(.body, design: .monospaced))
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "plus.circle.fill")
+                        Text("Add city")
+                    }
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(ForgeTheme.Colors.accent)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(ForgeTheme.Colors.accent.opacity(0.12))
+                    .clipShape(Capsule())
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+
+                Spacer()
+
+                if settings.worldClockCities != WorldClockCity.defaults {
+                    Button {
+                        settings.worldClockCities = WorldClockCity.defaults
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.counterclockwise")
+                            Text("Reset")
+                        }
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Restore Local + Stockholm")
+                }
+            }
+            .padding(.top, 4)
+        }
+    }
+
+    private func currentTime(in tz: TimeZone) -> String {
+        let f = DateFormatter()
+        f.timeZone = tz
+        f.dateFormat = "HH:mm"
+        return f.string(from: Date())
+    }
+}
+
+private struct EmptyStateView: View {
+    let icon: String
+    let title: String
+    let description: String
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 28))
+                .foregroundColor(.secondary)
+            Text(title)
+                .font(.system(size: 14, weight: .semibold))
+            Text(description)
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 20)
+    }
+}
+
+private struct AboutFact: View {
+    let icon: String
+    let value: String
+    let label: String
+    var body: some View {
+        VStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundColor(ForgeTheme.Colors.accent)
+            Text(value)
+                .font(.system(size: 14, weight: .semibold))
+            Text(label.uppercased())
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundColor(.secondary)
+                .tracking(0.5)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+    }
+}
+
+// MARK: - Shortcut Row (editable)
+
+struct ShortcutRow: View {
+    let actionName: String
+    let actionId: String
+    @ObservedObject var settings: SettingsManager
+    @State private var isRecording = false
+    @State private var hoveringEdit = false
+
+    private var binding: ShortcutBinding {
+        settings.binding(for: actionId)
+    }
+
+    private var isDefault: Bool {
+        binding == ShortcutBinding.defaults[actionId]
+    }
+
+    private var conflict: String? {
+        MacOSShortcutConflicts.description(keyCode: binding.keyCode,
+                                            modifiers: binding.nsModifiers)
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            // Action label + conflict warning
+            VStack(alignment: .leading, spacing: 2) {
+                Text(actionName)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(ForgeTheme.Colors.textPrimary)
+                if let conflict = conflict {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9))
+                        Text("Conflicts with \(conflict)")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .foregroundColor(.orange)
+                }
+            }
+
+            Spacer()
+
+            // Reset (only if non-default)
+            if !isDefault {
+                Button {
+                    settings.resetBinding(for: actionId)
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .frame(width: 22, height: 22)
+                        .background(Circle().fill(Color.black.opacity(0.04)))
+                }
+                .buttonStyle(.plain)
+                .help("Reset to default")
+            }
+
+            // The shortcut display itself (also recording target — click to record)
+            // Fixed width keeps every row aligned regardless of binding length
+            ShortcutRecorderView(
+                currentBinding: binding,
+                isRecording: $isRecording,
+                onRecord: { keyCode, modifiers in
+                    settings.updateBinding(for: actionId, keyCode: keyCode, modifiers: modifiers)
+                    isRecording = false
+                },
+                onCancel: { isRecording = false }
+            )
+            .frame(width: 160, height: 28)
+
+            // Edit (pencil) — explicit affordance to enter record mode
+            Button {
+                isRecording.toggle()
+            } label: {
+                Image(systemName: isRecording ? "xmark" : "pencil")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(isRecording ? .white : ForgeTheme.Colors.accent)
+                    .frame(width: 24, height: 24)
+                    .background(
+                        Circle().fill(
+                            isRecording
+                                ? ForgeTheme.Colors.accent
+                                : (hoveringEdit ? ForgeTheme.Colors.accent.opacity(0.18)
+                                                : ForgeTheme.Colors.accent.opacity(0.10))
+                        )
+                    )
+            }
+            .buttonStyle(.plain)
+            .onHover { hoveringEdit = $0 }
+            .help(isRecording ? "Stop recording" : "Edit shortcut")
+        }
+        .padding(.vertical, 10)
+    }
+}
+
+// MARK: - macOS shortcut conflict detection
+
+enum MacOSShortcutConflicts {
+    /// Returns a human-readable name of the conflicting macOS shortcut,
+    /// or nil if there's no known conflict.
+    static func description(keyCode: UInt16, modifiers: NSEvent.ModifierFlags) -> String? {
+        let mods = modifiers.intersection([.command, .shift, .option, .control])
+
+        struct Conflict { let keyCode: UInt16; let mods: NSEvent.ModifierFlags; let name: String }
+        let known: [Conflict] = [
+            // Key codes: 49=Space, 48=Tab, 36=Return, 53=Esc,
+            // 0=A, 1=S, 2=D, 3=F, 5=G, 6=Z, 8=C, 9=V, 12=Q, 13=W, 15=R, 17=T,
+            // 31=O, 35=P, 38=J, 45=N, 46=M, 50=`
+            Conflict(keyCode: 49, mods: [.command],                 name: "macOS Spotlight"),
+            Conflict(keyCode: 49, mods: [.command, .shift],         name: "macOS input source"),
+            Conflict(keyCode: 49, mods: [.control],                 name: "macOS Spotlight (alt)"),
+            Conflict(keyCode: 48, mods: [.command],                 name: "macOS app switcher"),
+            Conflict(keyCode: 48, mods: [.command, .shift],         name: "macOS app switcher (reverse)"),
+            Conflict(keyCode: 50, mods: [.command],                 name: "macOS window cycle"),
+            Conflict(keyCode: 53, mods: [.command, .option],        name: "Force Quit"),
+            Conflict(keyCode: 12, mods: [.command],                 name: "Quit app"),
+            Conflict(keyCode: 13, mods: [.command],                 name: "Close window"),
+            Conflict(keyCode: 13, mods: [.command, .option],        name: "Close all windows"),
+            Conflict(keyCode: 0,  mods: [.command],                 name: "Select all"),
+            Conflict(keyCode: 8,  mods: [.command],                 name: "Copy"),
+            Conflict(keyCode: 9,  mods: [.command],                 name: "Paste"),
+            Conflict(keyCode: 7,  mods: [.command],                 name: "Cut"),
+            Conflict(keyCode: 6,  mods: [.command],                 name: "Undo"),
+            Conflict(keyCode: 6,  mods: [.command, .shift],         name: "Redo"),
+            Conflict(keyCode: 1,  mods: [.command],                 name: "Save"),
+            Conflict(keyCode: 35, mods: [.command],                 name: "Print"),
+            Conflict(keyCode: 31, mods: [.command],                 name: "Open"),
+            Conflict(keyCode: 45, mods: [.command],                 name: "New"),
+            Conflict(keyCode: 3,  mods: [.command],                 name: "Find"),
+            Conflict(keyCode: 4,  mods: [.command],                 name: "Hide app"),
+            Conflict(keyCode: 46, mods: [.command],                 name: "Minimize"),
+            Conflict(keyCode: 3,  mods: [.control, .command],       name: "Full screen"),
+            Conflict(keyCode: 17, mods: [.command],                 name: "New tab"),
+            Conflict(keyCode: 13, mods: [.command, .shift],         name: "Reopen last closed tab"),
+        ]
+
+        if let match = known.first(where: { $0.keyCode == keyCode && $0.mods == mods }) {
+            return match.name
+        }
+        return nil
+    }
+}
+
+// MARK: - Shortcut Recorder (click to capture new key combo)
+
+struct ShortcutRecorderView: NSViewRepresentable {
+    let currentBinding: ShortcutBinding
+    @Binding var isRecording: Bool
+    let onRecord: (UInt16, NSEvent.ModifierFlags) -> Void
+    let onCancel: () -> Void
+
+    func makeNSView(context: Context) -> ShortcutRecorderNSView {
+        let view = ShortcutRecorderNSView()
+        view.displayString = currentBinding.displayString
+        view.onRecord = onRecord
+        view.onCancel = onCancel
+        return view
+    }
+
+    func updateNSView(_ nsView: ShortcutRecorderNSView, context: Context) {
+        nsView.displayString = currentBinding.displayString
+        if isRecording && !nsView.isRecording {
+            nsView.startRecording()
+        } else if !isRecording && nsView.isRecording {
+            nsView.stopRecording()
+        }
+    }
+}
+
+/// AppKit view that captures keyboard events when clicked
+final class ShortcutRecorderNSView: NSView {
+    var displayString: String = "" { didSet { needsDisplay = true } }
+    var isRecording: Bool = false { didSet { needsDisplay = true } }
+    var onRecord: ((UInt16, NSEvent.ModifierFlags) -> Void)?
+    var onCancel: (() -> Void)?
+
+    private var localMonitor: Any?
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: 120, height: 28)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if isRecording {
+            stopRecording()
+            onCancel?()
+        } else {
+            startRecording()
+        }
+    }
+
+    func startRecording() {
+        isRecording = true
+        window?.makeFirstResponder(self)
+
+        // Monitor key events to capture the shortcut
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+            guard let self = self, self.isRecording else { return event }
+
+            // Escape cancels recording
+            if event.keyCode == 53 {
+                self.stopRecording()
+                self.onCancel?()
+                return nil
+            }
+
+            // Need at least one modifier (prevent bare letters)
+            let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
+            guard !mods.isEmpty else { return nil }
+
+            self.onRecord?(UInt16(event.keyCode), mods)
+            self.stopRecording()
+            return nil // Consume the event
+        }
+
+        needsDisplay = true
+    }
+
+    func stopRecording() {
+        isRecording = false
+        if let monitor = localMonitor {
+            NSEvent.removeMonitor(monitor)
+            localMonitor = nil
+        }
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+
+        if isRecording {
+            // Recording state: highlighted border, pulsing bg
+            NSColor(calibratedWhite: 0.95, alpha: 1).setFill()
+            path.fill()
+            NSColor.systemBlue.withAlphaComponent(0.6).setStroke()
+            path.lineWidth = 2
+            path.stroke()
+
+            let text = "Press shortcut…"
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+                .foregroundColor: NSColor.systemBlue
+            ]
+            let str = NSAttributedString(string: text, attributes: attrs)
+            let size = str.size()
+            str.draw(at: NSPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2))
+        } else {
+            // Normal state: show current shortcut
+            NSColor(hex: "#F5F3EE").setFill()
+            path.fill()
+            NSColor(hex: "#E7E5E4").setStroke()
+            path.lineWidth = 1
+            path.stroke()
+
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .medium),
+                .foregroundColor: NSColor(hex: "#78716C")
+            ]
+            let str = NSAttributedString(string: displayString, attributes: attrs)
+            let size = str.size()
+            str.draw(at: NSPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2))
+        }
+    }
+}
+
+// MARK: - NSColor hex helper (for the recorder view)
+
+private extension NSColor {
+    convenience init(hex: String) {
+        let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        var int: UInt64 = 0
+        Scanner(string: hex).scanHexInt64(&int)
+        let r = CGFloat((int >> 16) & 0xFF) / 255
+        let g = CGFloat((int >> 8) & 0xFF) / 255
+        let b = CGFloat(int & 0xFF) / 255
+        self.init(srgbRed: r, green: g, blue: b, alpha: 1)
+    }
+}

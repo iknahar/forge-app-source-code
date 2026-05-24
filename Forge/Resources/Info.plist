@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Forge</string>
+    <key>CFBundleDisplayName</key>
+    <string>Forge</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.strativ.forge</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>Forge</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
+
+    <!-- Calendar usage description -->
+    <key>NSCalendarsUsageDescription</key>
+    <string>Forge needs calendar access to show your events in the menu bar and manage meeting reminders.</string>
+
+    <!-- Full calendar access (macOS 14+) -->
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>Forge needs full calendar access to create events and show your schedule in the menu bar.</string>
+
+    <!-- Accessibility usage (for window management and global hotkeys) -->
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Forge needs accessibility access to manage window positions and register global keyboard shortcuts.</string>
+
+    <!-- Camera usage (for meeting camera preview) -->
+    <key>NSCameraUsageDescription</key>
+    <string>Forge uses the camera for meeting preview, so you can check your appearance before joining.</string>
+
+    <!-- Microphone usage (for meeting mic preview) -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Forge uses the microphone to show your audio input level before joining meetings.</string>
+
+    <!-- Screen recording (for color picker, screen ruler, OCR) -->
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Forge uses screen capture for the Color Picker, Screen Ruler, and Text Extractor tools.</string>
+
+    <!-- OAuth callback URL scheme for Google Calendar / future providers -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>Forge OAuth Callback</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>com.strativ.forge</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>
