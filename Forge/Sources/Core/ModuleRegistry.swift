@@ -105,13 +105,4 @@ final class ModuleRegistry: ObservableObject {
         }
         settings.moduleStates = states
     }
-
-    // MARK: - Command Aggregation
-
-    /// Collects all commands from all enabled modules for the Command Palette
-    func allCommands() -> [ForgeCommand] {
-        modules
-            .filter { $0.isEnabled }
-            .flatMap { $0.commands() }
-    }
 }

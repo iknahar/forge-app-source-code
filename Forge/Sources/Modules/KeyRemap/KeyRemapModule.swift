@@ -9,7 +9,7 @@ final class KeyRemapModule: ForgeModule, ObservableObject {
     let name = "Key Remap"
     let description = "Remap keys and shortcuts"
     let iconName = "keyboard"
-    let category: ModuleCategory = .input
+    let category: ModuleCategory = .keyboard
     var isEnabled: Bool = true
 
     // MARK: - State
@@ -237,23 +237,6 @@ final class KeyRemapModule: ForgeModule, ObservableObject {
 
     // MARK: - Commands
 
-    func commands() -> [ForgeCommand] {
-        [
-            ForgeCommand(
-                id: "keyremap.toggle", title: "Key Remap — Toggle", subtitle: "Enable/disable key remapping",
-                iconName: "keyboard", moduleId: id,
-                action: { [weak self] in
-                    guard let self = self else { return }
-                    if self.eventTap != nil {
-                        self.removeEventTap()
-                    } else {
-                        self.installEventTap()
-                    }
-                },
-                keywords: ["key", "remap", "keyboard", "shortcut", "rebind", "toggle"]
-            ),
-        ]
-    }
 }
 
 // MARK: - Data Models

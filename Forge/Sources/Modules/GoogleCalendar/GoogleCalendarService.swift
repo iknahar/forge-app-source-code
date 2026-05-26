@@ -307,6 +307,7 @@ final class GoogleCalendarService: NSObject, ObservableObject {
         let hangoutLink: String?
         let conferenceData: ConferenceData?
         let attachments: [Attachment]?
+        let reminders: Reminders?
         let status: String?
 
         struct TimeRef: Decodable {
@@ -318,6 +319,7 @@ final class GoogleCalendarService: NSObject, ObservableObject {
             let email: String?
             let displayName: String?
             let responseStatus: String?
+            let organizer: Bool?
         }
         struct ConferenceData: Decodable {
             let entryPoints: [EntryPoint]?
@@ -332,6 +334,17 @@ final class GoogleCalendarService: NSObject, ObservableObject {
             let mimeType: String?
             let iconLink: String?
             let fileId: String?
+        }
+        /// Google's `reminders` object — either uses the calendar default
+        /// or carries an `overrides` array with per-event popup/email
+        /// reminders. We surface popup reminders only.
+        struct Reminders: Decodable {
+            let useDefault: Bool?
+            let overrides: [Override]?
+            struct Override: Decodable {
+                let method: String?    // "popup" | "email"
+                let minutes: Int?
+            }
         }
 
         func toCalendarEvent(
@@ -376,6 +389,25 @@ final class GoogleCalendarService: NSObject, ObservableObject {
                 )
             }
 
+            // Full attendees list — used by the event editor to show
+            // chips and let the organizer edit invites.
+            let mappedAttendees: [EventAttendee] = (attendees ?? []).compactMap { a in
+                guard let email = a.email, !email.isEmpty else { return nil }
+                return EventAttendee(
+                    email: email,
+                    displayName: a.displayName,
+                    responseStatus: a.responseStatus,
+                    isOrganizer: a.organizer ?? false
+                )
+            }
+
+            // Per-event popup reminders (minutes-before). Email
+            // reminders aren't surfaced — popup is the only kind Forge
+            // can mirror locally.
+            let popupReminders: [Int] = (reminders?.overrides ?? [])
+                .filter { ($0.method ?? "popup") == "popup" }
+                .compactMap { $0.minutes }
+
             return CalendarEvent(
                 id: "google:\(id)",
                 title: title,
@@ -395,7 +427,9 @@ final class GoogleCalendarService: NSObject, ObservableObject {
                 ),
                 myResponseStatus: myAttendee?.responseStatus,
                 confirmedAttendeeCount: confirmed,
-                attachments: mappedAttachments
+                attachments: mappedAttachments,
+                attendees: mappedAttendees,
+                remindersMinutes: popupReminders
             )
         }
 
@@ -484,21 +518,29 @@ final class GoogleCalendarService: NSObject, ObservableObject {
                      title: String,
                      start: Date,
                      end: Date,
+                     isAllDay: Bool = false,
                      location: String?,
                      notes: String? = nil,
                      meetingURL: String?,
-                     generateMeet: Bool = false) async throws -> EventMutationResult {
+                     generateMeet: Bool = false,
+                     attendees: [String] = [],
+                     attachments: [EventAttachment] = [],
+                     remindersMinutes: [Int] = []) async throws -> EventMutationResult {
         let token = try await validAccessToken(for: email)
 
         var body = Self.eventBody(
             title: title,
             start: start,
             end: end,
+            isAllDay: isAllDay,
             location: location,
             notes: notes,
             // If Google is going to mint the URL, don't also bake the
             // user's empty string into description.
-            meetingURL: generateMeet ? nil : meetingURL
+            meetingURL: generateMeet ? nil : meetingURL,
+            attendees: attendees,
+            attachments: attachments,
+            remindersMinutes: remindersMinutes
         )
         if generateMeet {
             body["conferenceData"] = [
@@ -509,9 +551,14 @@ final class GoogleCalendarService: NSObject, ObservableObject {
             ]
         }
 
+        // `supportsAttachments=true` is REQUIRED by Google when we
+        // attach Drive/URL files via the API. `sendUpdates=all` makes
+        // invitees actually get the email.
         let url = Self.eventsCollectionURL(
             calendarId: calendarId,
-            conferenceDataVersion: generateMeet ? 1 : nil
+            conferenceDataVersion: generateMeet ? 1 : nil,
+            supportsAttachments: !attachments.isEmpty,
+            sendUpdates: attendees.isEmpty ? nil : "all"
         )
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -557,26 +604,55 @@ final class GoogleCalendarService: NSObject, ObservableObject {
                      title: String? = nil,
                      start: Date? = nil,
                      end: Date? = nil,
+                     isAllDay: Bool? = nil,
                      location: String? = nil,
                      notes: String? = nil,
                      meetingURL: String? = nil,
-                     generateMeet: Bool = false) async throws -> EventMutationResult {
+                     generateMeet: Bool = false,
+                     attendees: [String]? = nil,
+                     attachments: [EventAttachment]? = nil,
+                     remindersMinutes: [Int]? = nil) async throws -> EventMutationResult {
         let token = try await validAccessToken(for: accountEmail)
 
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
+        let isoFormatter = ISO8601DateFormatter()
+        isoFormatter.formatOptions = [.withInternetDateTime]
+        let dateOnly = DateFormatter()
+        dateOnly.dateFormat = "yyyy-MM-dd"
+        dateOnly.timeZone = TimeZone(identifier: "UTC")
 
         var body: [String: Any] = [:]
         if let title { body["summary"] = title }
         if let location { body["location"] = location }
-        if let notes { body["description"] = notes }
-        if !generateMeet, let url = meetingURL, !url.isEmpty {
-            // When we're NOT auto-generating Meet, stash the manually-
-            // entered URL in description so it's clickable.
-            body["description"] = (notes.map { "\($0)\n\(url)" } ?? url)
+        // Notes get the manually-entered Meet URL appended when Google
+        // isn't minting one. Notes-nil + meetingURL-only means we still
+        // write a description so the URL is clickable.
+        if let notes, !notes.isEmpty {
+            if !generateMeet, let url = meetingURL, !url.isEmpty {
+                body["description"] = "\(notes)\n\(url)"
+            } else {
+                body["description"] = notes
+            }
+        } else if notes != nil {
+            // Caller explicitly cleared notes
+            body["description"] = ""
+        } else if !generateMeet, let url = meetingURL, !url.isEmpty {
+            body["description"] = url
         }
-        if let start { body["start"] = ["dateTime": f.string(from: start)] }
-        if let end   { body["end"]   = ["dateTime": f.string(from: end)] }
+
+        // Date vs dateTime semantics for all-day events
+        if let start {
+            let useAllDay = isAllDay ?? false
+            body["start"] = useAllDay
+                ? ["date": dateOnly.string(from: start)]
+                : ["dateTime": isoFormatter.string(from: start)]
+        }
+        if let end {
+            let useAllDay = isAllDay ?? false
+            body["end"] = useAllDay
+                ? ["date": dateOnly.string(from: end)]
+                : ["dateTime": isoFormatter.string(from: end)]
+        }
+
         if generateMeet {
             body["conferenceData"] = [
                 "createRequest": [
@@ -585,11 +661,34 @@ final class GoogleCalendarService: NSObject, ObservableObject {
                 ]
             ]
         }
+        if let attendees {
+            body["attendees"] = attendees.map { ["email": $0] }
+        }
+        if let attachments {
+            body["attachments"] = attachments.map { att -> [String: Any] in
+                var dict: [String: Any] = [
+                    "fileUrl": att.fileURL.absoluteString,
+                    "title": att.title,
+                ]
+                if let m = att.mimeType { dict["mimeType"] = m }
+                return dict
+            }
+        }
+        if let remindersMinutes {
+            body["reminders"] = [
+                "useDefault": remindersMinutes.isEmpty,
+                "overrides": remindersMinutes.map {
+                    ["method": "popup", "minutes": $0]
+                }
+            ]
+        }
 
         let url = Self.eventResourceURL(
             calendarId: calendarId,
             eventId: eventId,
-            conferenceDataVersion: generateMeet ? 1 : nil
+            conferenceDataVersion: generateMeet ? 1 : nil,
+            supportsAttachments: attachments?.isEmpty == false,
+            sendUpdates: attendees == nil ? nil : "all"
         )
         var req = URLRequest(url: url)
         req.httpMethod = "PATCH"
@@ -695,22 +794,40 @@ final class GoogleCalendarService: NSObject, ObservableObject {
 
     // MARK: URL + body helpers
 
+    /// Build query-string suffix from optional params. Returns "" or
+    /// "?a=1&b=2".
+    private static func queryString(_ items: [(String, String?)]) -> String {
+        let pairs = items.compactMap { (k, v) -> String? in
+            guard let v else { return nil }
+            return "\(k)=\(v)"
+        }
+        return pairs.isEmpty ? "" : "?" + pairs.joined(separator: "&")
+    }
+
     private static func eventsCollectionURL(
         calendarId: String,
-        conferenceDataVersion: Int? = nil
+        conferenceDataVersion: Int? = nil,
+        supportsAttachments: Bool = false,
+        sendUpdates: String? = nil
     ) -> URL {
         let encoded = calendarId.addingPercentEncoding(
             withAllowedCharacters: .urlPathAllowed
         ) ?? calendarId
         var s = "https://www.googleapis.com/calendar/v3/calendars/\(encoded)/events"
-        if let v = conferenceDataVersion { s += "?conferenceDataVersion=\(v)" }
+        s += queryString([
+            ("conferenceDataVersion", conferenceDataVersion.map { "\($0)" }),
+            ("supportsAttachments", supportsAttachments ? "true" : nil),
+            ("sendUpdates", sendUpdates),
+        ])
         return URL(string: s)!
     }
 
     private static func eventResourceURL(
         calendarId: String,
         eventId: String,
-        conferenceDataVersion: Int? = nil
+        conferenceDataVersion: Int? = nil,
+        supportsAttachments: Bool = false,
+        sendUpdates: String? = nil
     ) -> URL {
         let encCal = calendarId.addingPercentEncoding(
             withAllowedCharacters: .urlPathAllowed
@@ -719,24 +836,39 @@ final class GoogleCalendarService: NSObject, ObservableObject {
             withAllowedCharacters: .urlPathAllowed
         ) ?? eventId
         var s = "https://www.googleapis.com/calendar/v3/calendars/\(encCal)/events/\(encId)"
-        if let v = conferenceDataVersion { s += "?conferenceDataVersion=\(v)" }
+        s += queryString([
+            ("conferenceDataVersion", conferenceDataVersion.map { "\($0)" }),
+            ("supportsAttachments", supportsAttachments ? "true" : nil),
+            ("sendUpdates", sendUpdates),
+        ])
         return URL(string: s)!
     }
 
     private static func eventBody(title: String,
                                   start: Date,
                                   end: Date,
+                                  isAllDay: Bool,
                                   location: String?,
                                   notes: String?,
-                                  meetingURL: String?) -> [String: Any] {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
+                                  meetingURL: String?,
+                                  attendees: [String],
+                                  attachments: [EventAttachment],
+                                  remindersMinutes: [Int]) -> [String: Any] {
+        let isoFormatter = ISO8601DateFormatter()
+        isoFormatter.formatOptions = [.withInternetDateTime]
+        let dateOnly = DateFormatter()
+        dateOnly.dateFormat = "yyyy-MM-dd"
+        dateOnly.timeZone = TimeZone(identifier: "UTC")
 
-        var body: [String: Any] = [
-            "summary": title,
-            "start": ["dateTime": f.string(from: start)],
-            "end":   ["dateTime": f.string(from: end)],
-        ]
+        var body: [String: Any] = ["summary": title]
+        if isAllDay {
+            body["start"] = ["date": dateOnly.string(from: start)]
+            body["end"]   = ["date": dateOnly.string(from: end)]
+        } else {
+            body["start"] = ["dateTime": isoFormatter.string(from: start)]
+            body["end"]   = ["dateTime": isoFormatter.string(from: end)]
+        }
+
         if let loc = location, !loc.isEmpty { body["location"] = loc }
 
         // Compose description from notes + meeting URL
@@ -746,6 +878,39 @@ final class GoogleCalendarService: NSObject, ObservableObject {
             desc += url
         }
         if !desc.isEmpty { body["description"] = desc }
+
+        // Attendees — Google emails them automatically when
+        // sendUpdates=all is set on the request URL.
+        let trimmedAttendees = attendees
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if !trimmedAttendees.isEmpty {
+            body["attendees"] = trimmedAttendees.map { ["email": $0] }
+        }
+
+        // Attachments — `supportsAttachments=true` MUST be in the query
+        // string when this is non-empty (handled by the URL builder).
+        if !attachments.isEmpty {
+            body["attachments"] = attachments.map { att -> [String: Any] in
+                var dict: [String: Any] = [
+                    "fileUrl": att.fileURL.absoluteString,
+                    "title": att.title,
+                ]
+                if let m = att.mimeType { dict["mimeType"] = m }
+                return dict
+            }
+        }
+
+        // Per-event popup reminders. Empty array ⇒ fall back to the
+        // calendar's default reminders.
+        if !remindersMinutes.isEmpty {
+            body["reminders"] = [
+                "useDefault": false,
+                "overrides": remindersMinutes.map {
+                    ["method": "popup", "minutes": $0]
+                }
+            ]
+        }
         return body
     }
 

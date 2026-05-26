@@ -19,7 +19,11 @@ final class SettingsManager: ObservableObject {
         didSet { save() }
     }
 
-    @Published var menuBarTokens: [MenuBarToken] = [.icon, .nextEvent, .clock] {
+    /// Menu bar tokens shown next to the menu-bar icon. Defaults
+    /// to Icon + Next Event — the most useful pair for the
+    /// fresh-install experience: people see Forge's mark and the
+    /// next meeting at a glance.
+    @Published var menuBarTokens: [MenuBarToken] = [.icon, .nextEvent] {
         didSet { save() }
     }
 
@@ -33,9 +37,24 @@ final class SettingsManager: ObservableObject {
         didSet { save() }
     }
 
-    /// User-chosen emoji to use in place of the hammer icon in the menu bar
-    /// and previews. Empty string ⇒ fall back to the SF Symbol hammer.
-    @Published var menuBarEmoji: String = "" {
+    /// User-chosen emoji to use in place of the hammer icon in the
+    /// menu bar and previews. Defaults to ⚡ on a fresh install —
+    /// it reads punchier than the SF Symbol hammer at the small
+    /// menu-bar size and ties into the brand's "fast tool" idiom.
+    /// Empty string ⇒ fall back to the SF Symbol hammer.
+    @Published var menuBarEmoji: String = "⚡" {
+        didSet { save() }
+    }
+
+    /// Screenshot Translator — source language (auto-detect when empty).
+    /// Stored as a BCP-47 code (e.g. "sv", "en", "es"). Defaults to
+    /// Swedish per the brand's primary market.
+    @Published var translateSourceLanguage: String = "sv" {
+        didSet { save() }
+    }
+
+    /// Screenshot Translator — target language. BCP-47 code.
+    @Published var translateTargetLanguage: String = "en" {
         didSet { save() }
     }
 
@@ -54,10 +73,6 @@ final class SettingsManager: ObservableObject {
     }
 
     @Published var windowSnapModifier: SnapModifier = .controlOption {
-        didSet { save() }
-    }
-
-    @Published var alwaysOnTopBorderColor: String = "#E72903" {
         didSet { save() }
     }
 
@@ -93,6 +108,13 @@ final class SettingsManager: ObservableObject {
         didSet { save() }
     }
 
+    /// Per-action enable/disable state. Missing keys ⇒ enabled (the
+    /// default for every action). Disabled actions are skipped during
+    /// hotkey registration AND their gesture handlers refuse to fire.
+    @Published var actionEnabled: [String: Bool] = [:] {
+        didSet { save() }
+    }
+
     /// Look up a binding by action ID, falling back to built-in default
     func binding(for actionId: String) -> ShortcutBinding {
         shortcutBindings[actionId] ?? ShortcutBinding.defaults[actionId] ?? ShortcutBinding(keyCode: 0, modifiers: [])
@@ -111,6 +133,17 @@ final class SettingsManager: ObservableObject {
     /// Reset all bindings to factory defaults
     func resetAllBindings() {
         shortcutBindings = ShortcutBinding.defaults
+        actionEnabled = [:]
+    }
+
+    /// Is the action currently enabled? Missing entries default to true.
+    func isActionEnabled(_ actionId: String) -> Bool {
+        actionEnabled[actionId] ?? true
+    }
+
+    /// Flip the enable/disable flag and re-register hotkeys.
+    func setActionEnabled(_ actionId: String, _ enabled: Bool) {
+        actionEnabled[actionId] = enabled
     }
 
     // MARK: - Types
@@ -134,6 +167,7 @@ final class SettingsManager: ObservableObject {
         case icon         = "Icon"
         case date         = "Date"
         case clock        = "Clock"          // rawValue kept stable for back-compat
+        case ongoingMeeting = "Ongoing"      // currently-happening event (live)
         case nextEvent    = "Next Event"
         case countdown    = "Countdown"
         case weekNumber   = "Week"
@@ -149,10 +183,11 @@ final class SettingsManager: ObservableObject {
         /// User-facing chip label (lets us rename without breaking saved JSON).
         var displayName: String {
             switch self {
-            case .clock:        return "Time"
-            case .dayProgress:  return "Day %"
-            case .yearProgress: return "Year %"
-            default:            return rawValue
+            case .clock:           return "Time"
+            case .ongoingMeeting:  return "Ongoing"
+            case .dayProgress:     return "Day %"
+            case .yearProgress:    return "Year %"
+            default:               return rawValue
             }
         }
     }
@@ -202,8 +237,27 @@ final class SettingsManager: ObservableObject {
             // Merge saved bindings over defaults so new shortcuts get their defaults
             var merged = ShortcutBinding.defaults
             for (key, value) in bindings { merged[key] = value }
+
+            // Migration: older Forge versions defaulted Clipboard
+            // History to ⌃⌥V. The new default is ⌥V. If the user
+            // still has the OLD default saved (i.e. they never
+            // customized it), bump them to the new one. If they've
+            // bound clipboard to something else, leave their choice
+            // alone — only the legacy default gets migrated.
+            let legacyClipboard = ShortcutBinding(
+                keyCode: 9,
+                modifiers: [.control, .option]
+            )
+            if merged["clipboard"] == legacyClipboard {
+                merged["clipboard"] = ShortcutBinding(
+                    keyCode: 9,
+                    modifiers: [.option]
+                )
+            }
+
             self.shortcutBindings = merged
         }
+        if let v = decoded.actionEnabled { self.actionEnabled = v }
         // Calendar display preferences (backward-compatible — older files don't have these)
         if let v = decoded.showYearProgress    { self.showYearProgress = v }
         if let v = decoded.showDayProgress     { self.showDayProgress = v }
@@ -218,6 +272,8 @@ final class SettingsManager: ObservableObject {
         if let v = decoded.menuBarTimeFormat   { self.menuBarTimeFormat = v }
         if let v = decoded.menuBarSeparator    { self.menuBarSeparator = v }
         if let v = decoded.menuBarEmoji        { self.menuBarEmoji = v }
+        if let v = decoded.translateSourceLanguage { self.translateSourceLanguage = v }
+        if let v = decoded.translateTargetLanguage { self.translateTargetLanguage = v }
         if let v = decoded.linkedCalendars     { self.linkedCalendars = v }
         if let v = decoded.reminderBackgroundImagePath { self.reminderBackgroundImagePath = v }
     }
@@ -245,8 +301,11 @@ final class SettingsManager: ObservableObject {
             menuBarTimeFormat: menuBarTimeFormat,
             menuBarSeparator: menuBarSeparator,
             menuBarEmoji: menuBarEmoji,
+            translateSourceLanguage: translateSourceLanguage,
+            translateTargetLanguage: translateTargetLanguage,
             linkedCalendars: linkedCalendars,
-            reminderBackgroundImagePath: reminderBackgroundImagePath
+            reminderBackgroundImagePath: reminderBackgroundImagePath,
+            actionEnabled: actionEnabled
         )
 
         guard let data = try? JSONEncoder().encode(settings) else { return }
@@ -282,31 +341,135 @@ struct ShortcutBinding: Codable, Equatable {
 
     /// Factory defaults for every shortcut action
     static let defaults: [String: ShortcutBinding] = [
-        "commandPalette": ShortcutBinding(keyCode: 49, modifiers: [.option]),               // ⌥Space (⌘⇧Space conflicts with macOS)
-        "screenshot":     ShortcutBinding(keyCode: 1,  modifiers: [.control, .option]),     // ⌃⌥S
-        "mouseHighlight": ShortcutBinding(keyCode: 46, modifiers: [.command, .shift]),      // ⇧⌘M
-        "joinMeeting":    ShortcutBinding(keyCode: 38, modifiers: [.command, .shift]),       // ⌘⇧J
-        "alwaysOnTop":    ShortcutBinding(keyCode: 0,  modifiers: [.control, .option]),      // ⌃⌥A
-        "colorPicker":    ShortcutBinding(keyCode: 8,  modifiers: [.control, .option]),      // ⌃⌥C
-        "screenRuler":    ShortcutBinding(keyCode: 15, modifiers: [.control, .option]),      // ⌃⌥R
-        "textExtractor":  ShortcutBinding(keyCode: 17, modifiers: [.control, .option]),      // ⌃⌥T
-        "zoomIt":         ShortcutBinding(keyCode: 6,  modifiers: [.control, .option]),      // ⌃⌥Z
-        "fancyZones":     ShortcutBinding(keyCode: 3,  modifiers: [.control, .option]),      // ⌃⌥F
+        "screenshot":       ShortcutBinding(keyCode: 1,  modifiers: [.control, .option]),     // ⌃⌥S
+        // Find My Mouse is gesture-only (double-tap right ⌘) — no
+        // assignable shortcut here. The gesture is hard-wired in
+        // `MouseHighlightModule.setupRightCommandMonitor()`.
+        "clickHighlighter": ShortcutBinding(keyCode: 4,  modifiers: [.command, .option]),     // ⌘⌥H
+        "joinMeeting":      ShortcutBinding(keyCode: 38, modifiers: [.command, .shift]),       // ⌘⇧J
+        "pinWindow":        ShortcutBinding(keyCode: 13, modifiers: [.shift, .option]),        // ⇧⌥W
+        "colorPicker":      ShortcutBinding(keyCode: 8,  modifiers: [.control, .option]),      // ⌃⌥C
+        "screenRuler":      ShortcutBinding(keyCode: 15, modifiers: [.control, .option]),      // ⌃⌥R
+        "textExtractor":    ShortcutBinding(keyCode: 17, modifiers: [.control, .option]),      // ⌃⌥T
+        "zoomIt":           ShortcutBinding(keyCode: 6,  modifiers: [.control, .option]),      // ⌃⌥Z
+        "fancyZones":       ShortcutBinding(keyCode: 50, modifiers: [.option, .shift]),        // ⌥⇧` (backtick)
+        "clipboard":        ShortcutBinding(keyCode: 9,  modifiers: [.option]),                // ⌥V
+        "claudeLauncher":   ShortcutBinding(keyCode: 40, modifiers: [.control, .option]),      // ⌃⌥K
+        "openTerminal":     ShortcutBinding(keyCode: 17, modifiers: [.control, .option, .shift]), // ⌃⌥⇧T
     ]
 
-    /// All action IDs with human-readable names, in display order
-    static let allActions: [(id: String, name: String)] = [
-        ("commandPalette", "Command Bar"),
-        ("joinMeeting",    "Join Next Meeting"),
-        ("alwaysOnTop",    "Always On Top"),
-        ("colorPicker",    "Color Picker"),
-        ("screenRuler",    "Screen Ruler"),
-        ("textExtractor",  "Text Extractor (OCR)"),
-        ("zoomIt",         "ZoomIt"),
-        ("fancyZones",     "FancyZones Editor"),
-        ("screenshot",     "Screenshot & Annotate"),
-        ("mouseHighlight", "Find My Mouse"),
+    /// Grouping for the Settings → Shortcuts list. Each group renders
+    /// as its own card so related actions sit together visually.
+    enum ShortcutGroup: String, CaseIterable, Identifiable {
+        case calendar      = "Calendar & Meetings"
+        case window        = "Window Management"
+        case screen        = "Screen Tools"
+        case input         = "Mouse & Highlights"
+        case files         = "Files & Clipboard"
+        case developer     = "Developer"
+        var id: String { rawValue }
+        var iconName: String {
+            switch self {
+            case .calendar:  return "calendar"
+            case .window:    return "rectangle.split.3x1"
+            case .screen:    return "eyedropper"
+            case .input:     return "cursorarrow.click.2"
+            case .files:     return "doc.on.clipboard"
+            case .developer: return "terminal"
+            }
+        }
+    }
+
+    /// One action in the Shortcuts UI. Either keystroke-driven
+    /// (`gestureLabel == nil`, has an editable `ShortcutBinding`) or
+    /// gesture-driven (`gestureLabel == "Shift + Drag"` etc., no
+    /// editable binding). Both kinds render in the same group card
+    /// so related actions stay visually together — no more separate
+    /// "Gestures" section.
+    struct Action: Identifiable {
+        let id: String
+        let name: String
+        let description: String
+        let group: ShortcutGroup
+        let gestureLabel: String?
+
+        var isGesture: Bool { gestureLabel != nil }
+    }
+
+    /// All actions in display order, grouped by association. The flat
+    /// `allActions` view (preserved as a computed property below) is
+    /// what the hotkey registration loop walks — gestures are skipped
+    /// there because they have no keyboard binding.
+    static let allActionsGrouped: [Action] = [
+        // Calendar & Meetings
+        .init(id: "joinMeeting", name: "Join Next Meeting",
+              description: "Opens the meeting URL of the next event on your calendar.",
+              group: .calendar, gestureLabel: nil),
+
+        // Window Management — Pin + both FancyZones flavors live here.
+        .init(id: "pinWindow", name: "Pin Window",
+              description: "Holds the focused window above all others with a red border. Press again to release.",
+              group: .window, gestureLabel: nil),
+        .init(id: "fancyZones", name: "FancyZones Editor",
+              description: "Open the template gallery to pick or customize a tiling layout.",
+              group: .window, gestureLabel: nil),
+        .init(id: "fancyZonesSnap", name: "FancyZones Snap",
+              description: "Hold Shift while dragging a window — drop it into a zone to resize.",
+              group: .window, gestureLabel: "Shift + Drag"),
+
+        // Screen Tools
+        .init(id: "screenshot", name: "Screenshot & Annotate",
+              description: "Capture a region, draw on top, share, or live-translate the text inside.",
+              group: .screen, gestureLabel: nil),
+        .init(id: "colorPicker", name: "Color Picker",
+              description: "Magnified loupe — click any pixel to copy its color in HEX / RGB / HSL.",
+              group: .screen, gestureLabel: nil),
+        .init(id: "screenRuler", name: "Screen Ruler",
+              description: "Measure pixel distances on screen with edge snapping.",
+              group: .screen, gestureLabel: nil),
+        .init(id: "textExtractor", name: "Text Extractor (OCR)",
+              description: "Vision-powered OCR — select a region and the text lands on your clipboard.",
+              group: .screen, gestureLabel: nil),
+        .init(id: "zoomIt", name: "ZoomIt",
+              description: "Zoom into any part of the screen and draw on top — built for demos.",
+              group: .screen, gestureLabel: nil),
+
+        // Mouse & Highlights — Find My Mouse gesture + click highlighter.
+        .init(id: "findMyMouse", name: "Find My Mouse",
+              description: "Dark spotlight ring under the cursor — helpful on multi-monitor setups.",
+              group: .input, gestureLabel: "Double-tap right ⌘"),
+        .init(id: "clickHighlighter", name: "On Click Highlight",
+              description: "Small yellow ring at every mouse click. Toggles on / off.",
+              group: .input, gestureLabel: nil),
+
+        // Files & Clipboard
+        .init(id: "clipboard", name: "Clipboard History",
+              description: "Browse and paste from the last ~100 things you copied — text, images, files.",
+              group: .files, gestureLabel: nil),
+
+        // Developer
+        .init(id: "openTerminal", name: "Open Terminal",
+              description: "Open a fresh macOS Terminal.app window.",
+              group: .developer, gestureLabel: nil),
+        .init(id: "claudeLauncher", name: "Open Terminal · Claude",
+              description: "Open Terminal and start a Claude Code session in a new window.",
+              group: .developer, gestureLabel: nil),
     ]
+
+    /// Flat view of keystroke-bindable actions. Used by the hotkey
+    /// registration loop and the "Reset all to defaults" button. Skips
+    /// gesture-only actions because they have no `ShortcutBinding`.
+    static var allActions: [(id: String, name: String)] {
+        allActionsGrouped
+            .filter { !$0.isGesture }
+            .map { ($0.id, $0.name) }
+    }
+
+    /// Convenience: every action (both keystroke + gesture) in one
+    /// group, declaration order preserved.
+    static func actions(in group: ShortcutGroup) -> [Action] {
+        allActionsGrouped.filter { $0.group == group }
+    }
 
     // Key code → name mapping
     static func keyName(for keyCode: UInt16) -> String {
@@ -370,8 +533,11 @@ private struct PersistedSettings: Codable {
     let menuBarTimeFormat:   String?
     let menuBarSeparator:    String?
     let menuBarEmoji:        String?
+    let translateSourceLanguage: String?
+    let translateTargetLanguage: String?
     let linkedCalendars:     [LinkedCalendar]?
     let reminderBackgroundImagePath: String?
+    let actionEnabled:       [String: Bool]?
 }
 
 // MARK: - World Clock City

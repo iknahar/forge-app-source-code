@@ -5,12 +5,32 @@ import ApplicationServices
 @_silgen_name("_AXUIElementGetWindow")
 private func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<CGWindowID>) -> AXError
 
-/// Window Management module — FancyZones + Always On Top + Snap shortcuts.
-/// Provides zone-based window tiling, always-on-top pinning, and keyboard-driven snapping.
+// MARK: - SkyLight private API (window level for non-owned windows)
+//
+// AXRaise only raises a window above siblings in the SAME app — that's
+// why our previous pin-on-top implementation appeared to "pin" but
+// other apps still floated above. The standard fix used by every
+// always-on-top utility on macOS (Magnet, Rectangle Pro, BetterSnapTool,
+// Microsoft PowerToys port, etc.) is the private SkyLight call
+// `CGSSetWindowLevel`, which can elevate any window — including
+// third-party ones — to a higher window level. It has been stable
+// across every macOS release since 10.6 and is the only public-ish
+// way to make this work.
+
+@_silgen_name("CGSMainConnectionID")
+private func CGSMainConnectionID() -> Int32
+
+@_silgen_name("CGSSetWindowLevel")
+private func CGSSetWindowLevel(_ cid: Int32, _ wid: CGWindowID, _ level: Int32) -> Int32
+
+/// Pin Window module — keeps the focused window always-on-top with a
+/// thin red border, toggled by a global shortcut. FancyZones (zone
+/// tiling) lives in its own module now, so this one is scoped purely
+/// to the pin-window behaviour and reads as such in the Tools list.
 final class WindowManagerModule: ForgeModule, ObservableObject {
     let id = "windowManager"
-    let name = "Window Manager"
-    let description = "Snap zones, always on top, workspaces"
+    let name = "Pin Window"
+    let description = "Keep a window always on top with a single shortcut"
     let iconName = "rectangle.split.3x1"
     let category: ModuleCategory = .windows
     var isEnabled: Bool = true
@@ -18,8 +38,37 @@ final class WindowManagerModule: ForgeModule, ObservableObject {
     // MARK: - State
 
     @Published var activeLayout: ZoneLayout = .twoColumn
-    @Published var pinnedWindows: Set<CGWindowID> = []
     @Published var savedWorkspaces: [Workspace] = []
+
+    /// Currently pinned target. Nil = nothing pinned. Stays alive even
+    /// when the user minimises the pinned window — the border just
+    /// hides until the window comes back into view.
+    @Published private(set) var pinnedTarget: PinnedTarget?
+
+    /// Border overlay shown around the pinned window. Tracks the
+    /// window's frame on every poll tick.
+    private var borderPanel: PinnedWindowBorderPanel?
+
+    /// 60ms poll keeps the overlay glued to the window during drags /
+    /// resizes and continually calls `AXRaise` so the window stays
+    /// above other apps. AX has no "always on top" attribute for
+    /// third-party windows on macOS, so polling raise is the
+    /// industry-standard approach (used by Magnet, Rectangle Pro, etc.).
+    private var pinTimer: Timer?
+
+    struct PinnedTarget {
+        let pid: pid_t
+        let windowElement: AXUIElement
+        let windowID: CGWindowID
+        let appName: String
+    }
+
+    /// Window level we elevate pinned windows to. `kCGFloatingWindowLevel`
+    /// (3) sits above all normal app windows but below status-bar items
+    /// and Forge's own overlays. Picked deliberately so a system alert
+    /// can still display on top if one fires.
+    private let pinnedLevel = Int32(CGWindowLevelForKey(.floatingWindow))
+    private let normalLevel = Int32(CGWindowLevelForKey(.normalWindow))
 
     // MARK: - Lifecycle
 
@@ -29,8 +78,7 @@ final class WindowManagerModule: ForgeModule, ObservableObject {
     }
 
     func deactivate() {
-        // Remove all pin overlays
-        pinnedWindows.removeAll()
+        unpinWindow(playSound: false)
     }
 
     // MARK: - Zone Snapping
@@ -116,31 +164,181 @@ final class WindowManagerModule: ForgeModule, ObservableObject {
         moveFrontWindow(to: targetFrame)
     }
 
-    // MARK: - Always On Top
+    // MARK: - Pin Window
 
-    func toggleAlwaysOnTop() {
-        guard let frontApp = NSWorkspace.shared.frontmostApplication else { return }
-
-        // Use Accessibility API to get and modify window level
-        let appRef = AXUIElementCreateApplication(frontApp.processIdentifier)
-        var windowsRef: CFTypeRef?
-        AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &windowsRef)
-
-        guard let windows = windowsRef as? [AXUIElement], let frontWindow = windows.first else { return }
-
-        // Get window ID for tracking
-        var windowId: CGWindowID = 0
-        _AXUIElementGetWindow(frontWindow, &windowId)
-
-        if pinnedWindows.contains(windowId) {
-            pinnedWindows.remove(windowId)
-            setWindowLevel(frontWindow, level: .normal)
-            print("[Forge] Unpinned window \(windowId)")
+    /// Toggle pin on the currently focused window. If something is
+    /// already pinned, unpins it (regardless of which window is
+    /// currently focused) — the shortcut is a global "release the
+    /// current pin" too.
+    func togglePinWindow() {
+        if pinnedTarget != nil {
+            unpinWindow(playSound: true)
         } else {
-            pinnedWindows.insert(windowId)
-            setWindowLevel(frontWindow, level: .floating)
-            print("[Forge] Pinned window \(windowId)")
+            pinFocusedWindow()
         }
+    }
+
+    /// Capture the focused window of the frontmost app and start
+    /// holding it on top. Shows a red border + plays a pin sound.
+    private func pinFocusedWindow() {
+        guard let frontApp = NSWorkspace.shared.frontmostApplication else { return }
+        let appRef = AXUIElementCreateApplication(frontApp.processIdentifier)
+
+        // `kAXFocusedWindowAttribute` is the right read: `kAXWindowsAttribute`
+        // returns ALL windows of the app, ordered arbitrarily — picking
+        // .first there would pin the wrong window when the app has
+        // multiple open.
+        var windowRef: CFTypeRef?
+        let err = AXUIElementCopyAttributeValue(
+            appRef, kAXFocusedWindowAttribute as CFString, &windowRef
+        )
+        guard err == .success, let window = windowRef else {
+            // No focused window — likely the user is on the desktop, or
+            // Accessibility permission isn't granted. Soft-fail silently;
+            // System Settings → Privacy & Security → Accessibility shows
+            // the missing entitlement.
+            NSSound.beep()
+            return
+        }
+        let windowElement = window as! AXUIElement
+
+        // Resolve the window's CGWindowID — needed by SkyLight to set
+        // the level cross-app. If we can't, fail soft (border + AXRaise
+        // still kick in but the pin won't elevate over other apps).
+        var windowID: CGWindowID = 0
+        _AXUIElementGetWindow(windowElement, &windowID)
+
+        pinnedTarget = PinnedTarget(
+            pid: frontApp.processIdentifier,
+            windowElement: windowElement,
+            windowID: windowID,
+            appName: frontApp.localizedName ?? "Window"
+        )
+
+        // Elevate the window above other apps via SkyLight.
+        if windowID != 0 {
+            let conn = CGSMainConnectionID()
+            _ = CGSSetWindowLevel(conn, windowID, pinnedLevel)
+        }
+
+        // Build the red-border overlay.
+        let panel = PinnedWindowBorderPanel()
+        panel.orderFront(nil)
+        borderPanel = panel
+
+        // Start the raise + reposition poller.
+        pinTimer?.invalidate()
+        pinTimer = Timer.scheduledTimer(withTimeInterval: 0.06, repeats: true) { [weak self] _ in
+            self?.tickPin()
+        }
+        // Run one tick immediately so the border appears in place
+        // without a 60ms flash at (0, 0).
+        tickPin()
+
+        playPinSound(pin: true)
+    }
+
+    /// Stop tracking + tear down the overlay. Safe to call when no
+    /// window is pinned.
+    private func unpinWindow(playSound: Bool) {
+        pinTimer?.invalidate()
+        pinTimer = nil
+        borderPanel?.orderOut(nil)
+        borderPanel = nil
+
+        // Restore the window's normal level so it stops floating after
+        // we release it. If the app already quit, this is a no-op.
+        if let target = pinnedTarget, target.windowID != 0 {
+            let conn = CGSMainConnectionID()
+            _ = CGSSetWindowLevel(conn, target.windowID, normalLevel)
+        }
+
+        let hadTarget = pinnedTarget != nil
+        pinnedTarget = nil
+        if playSound, hadTarget {
+            playPinSound(pin: false)
+        }
+    }
+
+    /// One poll cycle: re-read the pinned window's frame, move the
+    /// border overlay to match, raise the window, and detect
+    /// minimize / app-quit so we can hide the border or auto-unpin.
+    private func tickPin() {
+        guard let target = pinnedTarget else { return }
+
+        // App went away? Unpin automatically.
+        if NSRunningApplication(processIdentifier: target.pid) == nil {
+            unpinWindow(playSound: false)
+            return
+        }
+
+        // Minimized? Hide the border but keep polling so we can show
+        // it again when the window is restored.
+        var minimizedRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(
+            target.windowElement,
+            kAXMinimizedAttribute as CFString,
+            &minimizedRef
+        )
+        if (minimizedRef as? Bool) == true {
+            borderPanel?.orderOut(nil)
+            return
+        }
+
+        // Read window frame (top-left origin, screen coordinates).
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(target.windowElement, kAXPositionAttribute as CFString, &posRef)
+        AXUIElementCopyAttributeValue(target.windowElement, kAXSizeAttribute as CFString, &sizeRef)
+
+        var pos = CGPoint.zero
+        var size = CGSize.zero
+        if let raw = posRef {
+            AXValueGetValue(raw as! AXValue, .cgPoint, &pos)
+        }
+        if let raw = sizeRef {
+            AXValueGetValue(raw as! AXValue, .cgSize, &size)
+        }
+        guard size.width > 0, size.height > 0 else { return }
+
+        // AX coords use top-left origin matching the global screen
+        // space (origin at the top-left of the primary display).
+        // NSWindow uses bottom-left. Convert.
+        let primaryHeight = NSScreen.screens.first?.frame.maxY ?? 0
+        // Expand the panel a few pt past the window edges so the
+        // 3pt stroke sits OUTSIDE the window rather than overlapping
+        // its content.
+        let inset: CGFloat = 3
+        let expanded = NSRect(
+            x: pos.x - inset,
+            y: (primaryHeight - pos.y - size.height) - inset,
+            width: size.width + inset * 2,
+            height: size.height + inset * 2
+        )
+
+        if let panel = borderPanel {
+            if !panel.isVisible { panel.orderFront(nil) }
+            panel.setFrame(expanded, display: false)
+        }
+
+        // Persistent raise — keeps the window above OTHER windows in
+        // the same app (AXRaise) AND above other apps (SkyLight level
+        // re-application — macOS resets levels on space switches and
+        // some app activations).
+        AXUIElementPerformAction(target.windowElement, kAXRaiseAction as CFString)
+        if target.windowID != 0 {
+            let conn = CGSMainConnectionID()
+            _ = CGSSetWindowLevel(conn, target.windowID, pinnedLevel)
+        }
+    }
+
+    /// Submarine on pin (distinct "tug" sound), Pop on unpin (release).
+    /// Both are bundled with macOS so we don't need to ship audio.
+    private func playPinSound(pin: Bool) {
+        let name: NSSound.Name = pin
+            ? NSSound.Name("Submarine")
+            : NSSound.Name("Pop")
+        NSSound(named: name)?.play()
     }
 
     // MARK: - Workspaces
@@ -224,15 +422,6 @@ final class WindowManagerModule: ForgeModule, ObservableObject {
         AXUIElementSetAttributeValue(frontWindow, kAXSizeAttribute as CFString, sizeValue)
     }
 
-    private func setWindowLevel(_ window: AXUIElement, level: NSWindow.Level) {
-        // Note: Setting window level via AX API is limited on macOS.
-        // Full implementation requires a helper process or accessibility permissions.
-        // This is a simplified version.
-        if level == .floating {
-            AXUIElementSetAttributeValue(window, "AXRaise" as CFString, kCFBooleanTrue)
-        }
-    }
-
     // MARK: - Persistence
 
     private var workspacesURL: URL {
@@ -253,55 +442,6 @@ final class WindowManagerModule: ForgeModule, ObservableObject {
 
     // MARK: - Module Protocol
 
-    func commands() -> [ForgeCommand] {
-        var commands: [ForgeCommand] = [
-            ForgeCommand(
-                id: "window.snapLeft", title: "Snap Left", subtitle: "Snap window to left half",
-                iconName: "rectangle.lefthalf.filled", moduleId: id,
-                action: { [weak self] in self?.snapFrontWindow(to: .left) },
-                keywords: ["snap", "left", "half", "window", "tile"]
-            ),
-            ForgeCommand(
-                id: "window.snapRight", title: "Snap Right", subtitle: "Snap window to right half",
-                iconName: "rectangle.righthalf.filled", moduleId: id,
-                action: { [weak self] in self?.snapFrontWindow(to: .right) },
-                keywords: ["snap", "right", "half", "window", "tile"]
-            ),
-            ForgeCommand(
-                id: "window.maximize", title: "Maximize", subtitle: "Fill the entire screen",
-                iconName: "rectangle.fill", moduleId: id,
-                action: { [weak self] in self?.snapFrontWindow(to: .maximize) },
-                keywords: ["maximize", "full", "screen", "window"]
-            ),
-            ForgeCommand(
-                id: "window.center", title: "Center Window", subtitle: "Center and resize to 60%",
-                iconName: "rectangle.center.inset.filled", moduleId: id,
-                action: { [weak self] in self?.snapFrontWindow(to: .center) },
-                keywords: ["center", "middle", "window"]
-            ),
-            ForgeCommand(
-                id: "window.alwaysOnTop", title: "Always On Top", subtitle: "Pin window above others",
-                iconName: "pin", moduleId: id,
-                action: { [weak self] in self?.toggleAlwaysOnTop() },
-                keywords: ["pin", "always", "top", "above", "float"]
-            ),
-        ]
-
-        // Add workspace launch commands
-        for workspace in savedWorkspaces {
-            commands.append(ForgeCommand(
-                id: "workspace.\(workspace.id)",
-                title: "Launch: \(workspace.name)",
-                subtitle: "\(workspace.apps.count) apps",
-                iconName: "square.grid.2x2",
-                moduleId: id,
-                action: { [weak self] in self?.launchWorkspace(workspace) },
-                keywords: ["workspace", "launch", workspace.name.lowercased()]
-            ))
-        }
-
-        return commands
-    }
 }
 
 // MARK: - Supporting Types
@@ -415,5 +555,56 @@ extension CGRect: @retroactive Codable {
 extension Array {
     subscript(safe index: Int) -> Element? {
         indices.contains(index) ? self[index] : nil
+    }
+}
+
+// MARK: - Pinned window border overlay
+
+/// Borderless, click-through panel that draws a red rounded stroke
+/// around the pinned window. Sits at `.statusBar` level so it floats
+/// above almost everything; mouse events pass through so the user
+/// can still interact with the window underneath normally.
+final class PinnedWindowBorderPanel: NSPanel {
+    init() {
+        super.init(
+            contentRect: .zero,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        ignoresMouseEvents = true
+        // `.statusBar` keeps the border above ordinary windows but
+        // below modal alerts, so it doesn't obscure system prompts.
+        level = .statusBar
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        isReleasedWhenClosed = false
+
+        let view = PinnedWindowBorderView(frame: .zero)
+        view.autoresizingMask = [.width, .height]
+        contentView = view
+    }
+
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+/// Draws the actual stroke. Re-renders on resize because the view
+/// auto-resizes inside the panel.
+final class PinnedWindowBorderView: NSView {
+    override var isFlipped: Bool { false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        // Inset by half-stroke so the line sits cleanly inside the
+        // view's bounds (Cocoa strokes are centered on the path).
+        let lineWidth: CGFloat = 3
+        let rect = bounds.insetBy(dx: lineWidth / 2, dy: lineWidth / 2)
+        let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
+        NSColor.systemRed.setStroke()
+        path.lineWidth = lineWidth
+        path.stroke()
     }
 }

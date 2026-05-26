@@ -260,22 +260,6 @@ final class ColorPickerModule: ForgeModule, ObservableObject {
 
     // MARK: - Module Protocol
 
-    func commands() -> [ForgeCommand] {
-        [
-            ForgeCommand(
-                id: "color.pick", title: "Pick Color", subtitle: "Sample any pixel on screen",
-                iconName: "eyedropper", moduleId: id,
-                action: { [weak self] in self?.startPicking() },
-                keywords: ["color", "pick", "sample", "eyedropper", "pixel", "hex", "rgb"]
-            ),
-            ForgeCommand(
-                id: "color.history", title: "Color History", subtitle: "View recently picked colors",
-                iconName: "clock", moduleId: id,
-                action: { /* Open history panel */ },
-                keywords: ["color", "history", "recent", "palette"]
-            ),
-        ]
-    }
 }
 
 // MARK: - Supporting Types

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// The main popover view that appears when clicking the menu bar icon.
 /// This is Forge's "home screen" — the calendar is the default view.
@@ -7,6 +8,7 @@ import SwiftUI
 struct MenuBarView: View {
     @EnvironmentObject var moduleRegistry: ModuleRegistry
     @EnvironmentObject var settings: SettingsManager
+    @Environment(\.openSettings) private var openSettings
     @State private var selectedTab: Tab = .calendar
     @State private var isHoveringSettings = false
 
@@ -87,8 +89,19 @@ struct MenuBarView: View {
 
             Spacer()
 
-            // Settings gear — Dot's subtle icon button (modern SettingsLink for macOS 14+)
-            SettingsLink {
+            // Settings gear — Dot's subtle icon button.
+            //
+            // We deliberately don't use SwiftUI's `SettingsLink` here:
+            // Forge is an LSUIElement app (menu-bar only, no Dock
+            // icon), and SettingsLink in that mode opens the Settings
+            // window behind whichever app currently has focus. Calling
+            // `NSApp.activate(ignoringOtherApps: true)` BEFORE
+            // openSettings (and rasing the window once it exists) is
+            // the only reliable way to bring it to the front on the
+            // first click.
+            Button {
+                openSettingsForeground()
+            } label: {
                 Image(systemName: "gearshape")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(
@@ -138,7 +151,7 @@ struct MenuBarView: View {
 
     /// Modules that are core surfaces, not user-toggleable utilities.
     /// They stay always-on and don't show in the Tools list.
-    private static let hiddenModuleIds: Set<String> = ["calendar", "commandPalette"]
+    private static let hiddenModuleIds: Set<String> = ["calendar"]
 
     private var toolsGrid: some View {
         VStack(alignment: .leading, spacing: ForgeTheme.Spacing.sm) {
@@ -169,46 +182,61 @@ struct MenuBarView: View {
     private func moduleRow(_ module: any ForgeModule) -> some View {
         let enabled = moduleRegistry.isEnabled(module.id)
         let shortcutText = shortcutDisplay(for: module.id)
+        let gesture = gestureLabel(for: module.id)
         return HStack(alignment: .top, spacing: ForgeTheme.Spacing.md) {
-            // Module icon — Dot's colored icon in subtle bg
-            Image(systemName: module.iconName)
-                .font(.system(size: 14, weight: .medium))
-                .foregroundColor(
-                    enabled
-                        ? ForgeTheme.Colors.accent
-                        : ForgeTheme.Colors.textMuted
-                )
-                .frame(width: ForgeTheme.Layout.moduleIconSize,
-                       height: ForgeTheme.Layout.moduleIconSize)
-                .background(
-                    enabled
-                        ? ForgeTheme.Colors.accent.opacity(0.08)
-                        : ForgeTheme.Colors.surfaceHover
-                )
-                .cornerRadius(ForgeTheme.Radius.small)
-                .padding(.top, 1)
+            // Module icon. On modules that have a primary action
+            // (Screenshot, Color Picker, Clipboard, Terminal, etc.)
+            // this becomes a clickable button — same behavior as the
+            // module's keyboard shortcut. Hover lights up the chip
+            // (accent ring + brighter tint + slight scale-up) so the
+            // affordance is obvious. The Toggle to the right stays a
+            // separate control.
+            ModuleIconButton(
+                moduleId: module.id,
+                iconName: module.iconName,
+                moduleName: module.name,
+                enabled: enabled
+            )
+            .padding(.top, 1)
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(module.name)
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(ForgeTheme.Colors.textPrimary)
 
-                // Shortcut hint — Dot-style monospaced pill (description removed
-                // to keep rows compact and avoid scroll overflow)
-                if let shortcutText = shortcutText {
-                    Text(shortcutText)
-                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                        .foregroundColor(ForgeTheme.Colors.textTertiary)
-                        .padding(.horizontal, 2)
-                        .padding(.vertical, 1)
-                        .background(
-                            RoundedRectangle(cornerRadius: 3)
-                                .fill(Color.black.opacity(0.04))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 3)
-                                .stroke(Color.black.opacity(0.06), lineWidth: 0.5)
-                        )
+                // Keystroke chip + gesture chip live on the same row.
+                // Both render only when present so single-shortcut and
+                // double-trigger (keystroke + gesture) modules look
+                // tidy.
+                HStack(spacing: 4) {
+                    if let shortcutText = shortcutText {
+                        Text(shortcutText)
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .foregroundColor(ForgeTheme.Colors.textTertiary)
+                            .padding(.horizontal, 3).padding(.vertical, 1)
+                            .background(
+                                RoundedRectangle(cornerRadius: 3)
+                                    .fill(ForgeTheme.Colors.surfaceHover)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 3)
+                                    .stroke(ForgeTheme.Colors.borderDefault, lineWidth: 0.5)
+                            )
+                    }
+                    if let gesture = gesture {
+                        Text(gesture)
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(ForgeTheme.Colors.textTertiary)
+                            .padding(.horizontal, 4).padding(.vertical, 1)
+                            .background(
+                                Capsule().fill(ForgeTheme.Colors.surfaceHover)
+                            )
+                            .overlay(
+                                Capsule().strokeBorder(
+                                    ForgeTheme.Colors.borderDefault, lineWidth: 0.5
+                                )
+                            )
+                    }
                 }
             }
 
@@ -250,8 +278,8 @@ struct MenuBarView: View {
 
     private var footerBar: some View {
         HStack {
-            // Footer reserved — both day progress and the Command Bar hint
-            // have been removed per the latest design decisions.
+            // Footer reserved — day progress + bottom hints have been
+            // removed per the latest design decisions.
             Spacer()
         }
         // Footer matches calendar / tools at zero L/R inset.
@@ -261,26 +289,112 @@ struct MenuBarView: View {
     // MARK: - Helpers
 
     /// Maps a module's id to the global hotkey binding that activates it (if any).
+    /// Static gesture-trigger label for modules whose primary
+    /// activation is a hand/key gesture rather than an editable
+    /// shortcut. Rendered as a sub-line in the Tools row.
+    private func gestureLabel(for moduleId: String) -> String? {
+        switch moduleId {
+        case "mouseHighlight":   return "Double-tap right ⌘"
+        case "fancyZones":       return "Shift + Drag"
+        case "textExpander":     return "Type triggers"
+        default:                 return nil
+        }
+    }
+
     /// Returns the user's current binding as a display string (e.g. "⌃⌥C"), or nil
     /// for modules without a primary shortcut.
     private func shortcutDisplay(for moduleId: String) -> String? {
         let bindingId: String?
         switch moduleId {
-        case "commandPalette":   bindingId = "commandPalette"
         case "colorPicker":      bindingId = "colorPicker"
         case "screenRuler":      bindingId = "screenRuler"
         case "textExtractor":    bindingId = "textExtractor"
         case "zoomIt":           bindingId = "zoomIt"
         case "fancyZones":       bindingId = "fancyZones"
-        case "windowManager":    bindingId = "alwaysOnTop"
+        case "windowManager":    bindingId = "pinWindow"
         case "meetingReminder":  bindingId = "joinMeeting"
         case "screenshotAnnotate": bindingId = "screenshot"
-        case "mouseHighlight":   bindingId = "mouseHighlight"
+        case "clipboard":        bindingId = "clipboard"
+        case "claudeLauncher":   bindingId = "claudeLauncher"
+        case "openTerminal":     bindingId = "openTerminal"
+        // Mouse Highlight has two flavors: the gesture-driven Find
+        // My Mouse (double-tap right ⌘) and the keystroke-driven
+        // Click Highlighter (⌘⌥H). Surface the keystroke chip — the
+        // gesture appears as a sub-line via `gestureLabel(for:)`.
+        case "mouseHighlight":   bindingId = "clickHighlighter"
+        // Text Expander has no global hotkey — it activates on type.
+        // The Tools row gets a gesture sub-line ("Type triggers").
         default:                 bindingId = nil
         }
         guard let id = bindingId else { return nil }
         let str = settings.binding(for: id).displayString
         return str.isEmpty ? nil : str
+    }
+
+    /// Bring Forge to the foreground, open the Settings window, and
+    /// raise it. Handles three states:
+    ///   1. Settings not open at all  → `openSettings()` builds it.
+    ///   2. Settings open + visible behind another app → just raise it.
+    ///   3. Settings minimised in the Dock → deminiaturize + raise.
+    ///
+    /// Two-phase because `openSettings()` doesn't instantiate the
+    /// NSWindow synchronously; we have to wait a runloop tick before
+    /// the new window appears in `NSApp.windows`.
+    private func openSettingsForeground() {
+        NSApp.activate(ignoringOtherApps: true)
+        openSettings()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            guard let win = Self.findSettingsWindow() else { return }
+            if win.isMiniaturized {
+                win.deminiaturize(nil)
+            }
+            // Briefly bump to .floating so the window slides above
+            // whatever full-screen app is on top, then settle back to
+            // .normal so it behaves like any other window from there.
+            win.level = .floating
+            win.makeKeyAndOrderFront(nil)
+            win.orderFrontRegardless()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                win.level = .normal
+            }
+        }
+    }
+
+    /// Locate Forge's Settings NSWindow. SwiftUI's Settings scene on
+    /// macOS 14+ doesn't expose the window directly, so we filter
+    /// `NSApp.windows` by what the Settings window IS NOT — popover
+    /// frames, status-bar items, panels, etc. The remaining titled,
+    /// non-floating NSWindow is the Settings one.
+    private static func findSettingsWindow() -> NSWindow? {
+        // First pass: explicit title match. SwiftUI titles the
+        // Settings window with the localised "Settings" string or the
+        // window's `.navigationTitle`. Forge sets a "Forge Settings"
+        // header internally; the OS chrome shows just "Settings".
+        if let win = NSApp.windows.first(where: { w in
+            let t = w.title.lowercased()
+            return w.isVisible || w.isMiniaturized
+                ? (t.contains("settings") || t.contains("preferences"))
+                : false
+        }) {
+            return win
+        }
+
+        // Fallback: pick the largest non-popover, non-panel window
+        // currently on screen. Popover internals are NSPanel subclasses
+        // and have empty titles; the status-bar window has class
+        // `NSStatusBarWindow`. The Settings window is a plain
+        // `NSWindow` with a non-empty title and a 1020×660 frame.
+        let candidates = NSApp.windows.filter { w in
+            guard !(w is NSPanel) else { return false }
+            let className = String(describing: type(of: w))
+            if className.contains("StatusBar") || className.contains("Popover") {
+                return false
+            }
+            return w.isVisible || w.isMiniaturized
+        }
+        return candidates.max(by: {
+            ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height)
+        })
     }
 
     private var dayOfWeekString: String {
@@ -324,5 +438,87 @@ struct MenuBarView: View {
 
     private var dayProgressPercent: Int {
         Int(dayProgress * 100)
+    }
+}
+
+// MARK: - ModuleIconButton
+//
+// Pulled out into its own struct so each icon can carry its own
+// @State for hover without rows fighting over a shared source.
+// Renders the icon chip identically in two branches:
+//   • triggerable modules — wrapped in a Button that calls
+//     AppDelegate.triggerPrimaryAction, with the full hover
+//     affordance (ring + tint brighten + scale bump).
+//   • non-triggerable modules (Calendar, KeyRemap, TextExpander,
+//     etc.) — a plain static image, no hover effects, the cursor
+//     reads it as decoration.
+
+private struct ModuleIconButton: View {
+    let moduleId: String
+    let iconName: String
+    let moduleName: String
+    let enabled: Bool
+
+    @State private var hovering = false
+
+    private var triggerable: Bool {
+        AppDelegate.shared?.hasPrimaryAction(forModuleId: moduleId) ?? false
+    }
+
+    var body: some View {
+        // We deliberately do NOT wrap the icon in a SwiftUI `Button`
+        // here. On macOS, `Button` installs hit-test tracking that
+        // can swallow scroll-wheel events inside the popover's
+        // NSScrollView-backed container (see ScrollableContainer.swift)
+        // — that breaks vertical scroll on the Tools tab. A bare
+        // `.contentShape(Rectangle()) + .onTapGesture` gives the same
+        // click behavior without interfering with scroll.
+        Group {
+            if triggerable {
+                iconChip
+                    .contentShape(Rectangle())
+                    .onHover { hovering = $0 }
+                    .onTapGesture {
+                        _ = AppDelegate.shared?
+                            .triggerPrimaryAction(forModuleId: moduleId)
+                    }
+                    .help("Run \(moduleName)")
+            } else {
+                iconChip
+            }
+        }
+    }
+
+    private var iconChip: some View {
+        Image(systemName: iconName)
+            .font(.system(size: 14, weight: .medium))
+            .foregroundColor(
+                enabled
+                    ? ForgeTheme.Colors.accent
+                    : ForgeTheme.Colors.textMuted
+            )
+            .frame(
+                width: ForgeTheme.Layout.moduleIconSize,
+                height: ForgeTheme.Layout.moduleIconSize
+            )
+            .background(
+                Group {
+                    if enabled {
+                        ForgeTheme.Colors.accent.opacity(hovering ? 0.18 : 0.08)
+                    } else {
+                        ForgeTheme.Colors.surfaceHover.opacity(hovering ? 1.6 : 1.0)
+                    }
+                }
+            )
+            .cornerRadius(ForgeTheme.Radius.small)
+            .overlay(
+                RoundedRectangle(cornerRadius: ForgeTheme.Radius.small)
+                    .stroke(
+                        hovering ? ForgeTheme.Colors.accent.opacity(0.6) : Color.clear,
+                        lineWidth: 1
+                    )
+            )
+            .scaleEffect(hovering ? 1.08 : 1.0)
+            .animation(.easeOut(duration: 0.14), value: hovering)
     }
 }

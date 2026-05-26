@@ -97,16 +97,6 @@ final class ScreenRulerModule: ForgeModule, ObservableObject {
 
     // MARK: - Commands
 
-    func commands() -> [ForgeCommand] {
-        [
-            ForgeCommand(
-                id: "ruler.measure", title: "Screen Ruler", subtitle: "Measure pixels on screen",
-                iconName: "ruler", moduleId: id,
-                action: { [weak self] in self?.startMeasuring() },
-                keywords: ["ruler", "measure", "pixel", "screen", "distance", "bounds"]
-            ),
-        ]
-    }
 }
 
 // MARK: - Measurement Result

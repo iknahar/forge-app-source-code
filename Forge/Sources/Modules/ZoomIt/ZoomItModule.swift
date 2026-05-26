@@ -200,22 +200,6 @@ final class ZoomItModule: ForgeModule, ObservableObject {
 
     // MARK: - Commands
 
-    func commands() -> [ForgeCommand] {
-        [
-            ForgeCommand(
-                id: "zoomit.zoom", title: "ZoomIt — Zoom Screen", subtitle: "Magnify screen region",
-                iconName: "plus.magnifyingglass", moduleId: id,
-                action: { [weak self] in self?.startZoom() },
-                keywords: ["zoom", "magnify", "screen", "present", "enlarge"]
-            ),
-            ForgeCommand(
-                id: "zoomit.timer", title: "ZoomIt — Break Timer", subtitle: "Fullscreen countdown timer",
-                iconName: "timer", moduleId: id,
-                action: { [weak self] in self?.startTimer() },
-                keywords: ["timer", "break", "countdown", "rest", "pause"]
-            ),
-        ]
-    }
 }
 
 // MARK: - Zoom Overlay View

@@ -24,17 +24,41 @@ final class CalendarModule: ForgeModule, ObservableObject {
 
     // MARK: - Computed
 
+    /// `events` minus anything the current user has declined. This is
+    /// the list every "what's coming up" view should iterate — if the
+    /// user said "no" to a meeting, it shouldn't show in their
+    /// menu-bar countdown, ongoing slot, or upcoming list. Events
+    /// the user is the organizer of (or that came from EventKit
+    /// without an RSVP) keep `myResponseStatus == nil` and pass
+    /// through unaffected.
+    var activeEvents: [CalendarEvent] {
+        events.filter { $0.myResponseStatus != "declined" }
+    }
+
     var nextEvent: CalendarEvent? {
         let now = Date()
-        return events
+        return activeEvents
             .filter { $0.startDate > now }
             .sorted { $0.startDate < $1.startDate }
             .first
     }
 
+    /// The event currently happening RIGHT NOW (start ≤ now < end).
+    /// Used by the menu-bar's `ongoingMeeting` token. If multiple
+    /// events overlap, picks the one that started most recently —
+    /// that's almost always the meeting the user is paying attention
+    /// to (a long all-day "Working Day" loses to a 9:00 Standup).
+    var ongoingEvent: CalendarEvent? {
+        let now = Date()
+        return activeEvents
+            .filter { $0.startDate <= now && $0.endDate > now && !$0.isAllDay }
+            .sorted { $0.startDate > $1.startDate }
+            .first
+    }
+
     var todayEvents: [CalendarEvent] {
         let calendar = Calendar.current
-        return events.filter { calendar.isDateInToday($0.startDate) }
+        return activeEvents.filter { calendar.isDateInToday($0.startDate) }
     }
 
     var focusTimeToday: TimeInterval {
@@ -145,6 +169,14 @@ final class CalendarModule: ForgeModule, ObservableObject {
                     !ekExternalIds.contains(String(event.id.dropFirst("google:".count)))
                 }
                 self.events = ekEvents + uniqueGoogle
+
+                // Rebuild the contacts directory from the merged event
+                // list — used by the attendee autocomplete in the
+                // event editor. Cheap: in-memory dedupe on email.
+                let myEmails = Set(
+                    GoogleCalendarService.shared.accounts.map(\.email)
+                )
+                ContactsDirectory.shared.rebuild(from: self.events, myEmails: myEmails)
             }
         }
     }
@@ -152,11 +184,14 @@ final class CalendarModule: ForgeModule, ObservableObject {
     // MARK: - Meeting Join
 
     func joinNextMeeting() {
-        guard let next = nextEvent, let url = next.meetingURL else {
+        guard let next = nextEvent, next.meetingURL != nil else {
             print("[Forge Calendar] No upcoming meeting with a join link.")
             return
         }
-        NSWorkspace.shared.open(url)
+        // Routes through `MeetingLauncher.join` (not `.open`) so the
+        // reminder banner picks up the `.meetingJoined` signal and
+        // stops nagging about this event.
+        MeetingLauncher.join(next)
     }
 
     // MARK: - Timer
@@ -176,37 +211,6 @@ final class CalendarModule: ForgeModule, ObservableObject {
         )
     }
 
-    func commands() -> [ForgeCommand] {
-        [
-            ForgeCommand(
-                id: "calendar.new",
-                title: "New Event",
-                subtitle: "Create a calendar event",
-                iconName: "plus.circle",
-                moduleId: id,
-                action: { /* Open event creation */ },
-                keywords: ["new", "event", "create", "calendar", "meeting"]
-            ),
-            ForgeCommand(
-                id: "calendar.today",
-                title: "Go to Today",
-                subtitle: "Jump to today's date",
-                iconName: "calendar.circle",
-                moduleId: id,
-                action: { [weak self] in self?.selectedDate = Date() },
-                keywords: ["today", "now", "current"]
-            ),
-            ForgeCommand(
-                id: "calendar.join",
-                title: "Join Next Meeting",
-                subtitle: nextEvent?.title ?? "No upcoming meeting",
-                iconName: "video",
-                moduleId: id,
-                action: { [weak self] in self?.joinNextMeeting() },
-                keywords: ["join", "meeting", "zoom", "meet", "teams"]
-            )
-        ]
-    }
 }
 
 // MARK: - Calendar Event Model
@@ -225,6 +229,20 @@ struct EventAttachment: Equatable, Identifiable {
     let iconURL: URL?
 }
 
+/// One person invited to a calendar event. We keep the response status
+/// so the UI can show accepted / declined / tentative pips next to
+/// each name.
+struct EventAttendee: Equatable, Identifiable {
+    var id: String { email.lowercased() }
+    let email: String
+    let displayName: String?
+    /// "accepted", "tentative", "declined", "needsAction", or nil.
+    let responseStatus: String?
+    /// True for the event organizer — usually drawn with a different
+    /// chip color so the user can tell at a glance.
+    let isOrganizer: Bool
+}
+
 struct CalendarEvent: Identifiable {
     let id: String
     let title: String
@@ -240,6 +258,14 @@ struct CalendarEvent: Identifiable {
     /// Drive / Notion / Figma / etc. files attached to the event via
     /// Google Calendar's `attachments` field.
     let attachments: [EventAttachment]
+
+    /// Full attendees list (Google events only). Each entry has the
+    /// person's email, optional display name, and current RSVP status.
+    let attendees: [EventAttendee]
+
+    /// Per-event override reminders (minutes before event start, popup
+    /// notification only). Empty array ⇒ event uses calendar default.
+    let remindersMinutes: [Int]
 
     /// Routing info for Google-sourced events so we can edit / delete via
     /// the Google Calendar v3 REST API. Nil for EventKit-only events.
@@ -292,6 +318,10 @@ struct CalendarEvent: Identifiable {
         self.myResponseStatus = nil
         // EventKit events don't have structured attachments — left empty.
         self.attachments = []
+        // EventKit attendees and reminders aren't surfaced for editing
+        // through Forge; we only round-trip Google events here.
+        self.attendees = []
+        self.remindersMinutes = []
     }
 
     // Preview/mock initializer
@@ -310,7 +340,9 @@ struct CalendarEvent: Identifiable {
         googleRouting: GoogleRouting? = nil,
         myResponseStatus: String? = nil,
         confirmedAttendeeCount: Int = 0,
-        attachments: [EventAttachment] = []
+        attachments: [EventAttachment] = [],
+        attendees: [EventAttendee] = [],
+        remindersMinutes: [Int] = []
     ) {
         self.id = id
         self.title = title
@@ -327,39 +359,60 @@ struct CalendarEvent: Identifiable {
         self.myResponseStatus = myResponseStatus
         self.confirmedAttendeeCount = confirmedAttendeeCount
         self.attachments = attachments
+        self.attendees = attendees
+        self.remindersMinutes = remindersMinutes
     }
 
     var hasMeetingLink: Bool { meetingURL != nil }
 
     var meetingService: String? {
-        guard let url = meetingURL?.absoluteString.lowercased() else { return nil }
-        if url.contains("zoom.us") { return "Zoom" }
-        if url.contains("meet.google") { return "Meet" }
-        if url.contains("teams.microsoft") { return "Teams" }
-        if url.contains("webex") { return "Webex" }
-        return "Video"
+        guard let url = meetingURL else { return nil }
+        return MeetingLauncher.service(for: url) ?? "Video"
     }
 
     // MARK: - URL Extraction
 
-    private static let meetingPatterns = [
-        "zoom.us/j/",
+    /// Substring fingerprints we accept as "this is a meeting URL".
+    /// Ordered roughly by frequency — first match wins. Each Zoom /
+    /// Teams / Webex pattern covers the common URL shapes those
+    /// services actually mint (personal rooms, signed-in attendees,
+    /// web-client redirects, etc.).
+    private static let meetingPatterns: [String] = [
+        // Zoom
+        "zoom.us/j/",           // standard join
+        "zoom.us/s/",           // signed-in attendee
+        "zoom.us/my/",          // personal room
+        "zoom.us/wc/join/",     // web client
+        // Google Meet
         "meet.google.com/",
+        // Microsoft Teams
         "teams.microsoft.com/l/meetup-join",
+        "teams.microsoft.com/l/meeting",
+        "teams.live.com/meet/",
+        // Cisco Webex
         "webex.com/meet/",
+        "webex.com/webappng/sites/",
+        "webex.com/wbxmjs/joinservice",
+        // Independents
         "whereby.com/",
         "around.co/",
-        "tuple.app/"
+        "tuple.app/",
     ]
 
     static func extractMeetingURL(from event: EKEvent) -> URL? {
         let sources = [event.url?.absoluteString, event.location, event.notes]
             .compactMap { $0 }
 
+        // Escape the pattern so regex meta-characters in our pattern
+        // table (none today, but futureproof) don't break the search.
         for source in sources {
             for pattern in meetingPatterns {
+                let escaped = NSRegularExpression.escapedPattern(for: pattern)
                 if source.contains(pattern),
-                   let range = source.range(of: "https?://\\S+\(pattern)\\S*", options: .regularExpression),
+                   let range = source.range(
+                       of: "https?://\\S*\(escaped)\\S*",
+                       options: .regularExpression
+                   ),
                    let url = URL(string: String(source[range])) {
                     return url
                 }

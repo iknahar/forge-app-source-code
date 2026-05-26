@@ -14,8 +14,22 @@ struct CalendarView: View {
     @EnvironmentObject var settings: SettingsManager
     @State private var hoveredDate: Date?
     @State private var todayPulse = false
-    @State private var creatingEvent: Bool = false
+    /// Carries the start time for a pending create-event sheet. nil ⇒
+    /// no sheet open. Set by the "+ ⌘N" button (default start) or by
+    /// right-clicking a day cell (cell's date at 9 AM).
+    @State private var pendingCreateStart: CreateStart?
     @State private var editingEvent: CalendarEvent?
+    /// When set, an inline detail card popover is anchored to the
+    /// tapped event row. The Edit / Copy / Delete actions inside that
+    /// card route through `editingEvent` (full editor) or directly via
+    /// the Google service.
+    @State private var detailEvent: CalendarEvent?
+
+    /// Wrapper for `.sheet(item:)` — Date doesn't conform to Identifiable.
+    struct CreateStart: Identifiable {
+        let id = UUID()
+        let date: Date
+    }
 
     private let calendar = Calendar.current
 
@@ -66,13 +80,15 @@ struct CalendarView: View {
         }
         // Create-event sheet — triggered by the "+ ⌘N" button next to the
         // TODAY header. Defaults the start time to the next round hour on
-        // the currently selected date.
-        .sheet(isPresented: $creatingEvent) {
-            NewEventSheet(start: defaultNewEventStart()) { created in
+        // the currently selected date. Uses the natural-language quick-
+        // create sheet; the expanded editor is reachable via the event
+        // row's "Edit" action.
+        .sheet(item: $pendingCreateStart) { slot in
+            QuickCreateEventSheet(defaultStart: slot.date) { created in
                 if let ev = created {
                     calendarModule.events.append(ev)
                 }
-                creatingEvent = false
+                pendingCreateStart = nil
                 calendarModule.loadEvents()
             }
         }
@@ -330,12 +346,14 @@ struct CalendarView: View {
     }
 
     /// Which display-column indices are weekend columns, given the configured week start.
+    /// Weekend = the last two columns of the displayed week. Holds
+    /// across both week-start preferences:
+    ///   • Mon first → columns are [Mon..Sun] → weekend = Sat+Sun
+    ///   • Sun first → columns are [Sun..Sat] → weekend = Fri+Sat
+    ///     (South-Asia / Middle-East working week — Sun is a working
+    ///     day, Fri+Sat are off.)
     private func isWeekendColumn(_ index: Int) -> Bool {
-        if settings.weekStartsOnMonday {
-            return index == 5 || index == 6  // Sat, Sun at the end
-        } else {
-            return index == 0 || index == 6  // Sun (start) + Sat (end)
-        }
+        index == 5 || index == 6
     }
 
     /// Compute the ISO week-of-year for each of the 6 grid rows.
@@ -362,7 +380,9 @@ struct CalendarView: View {
         let isHovered = hoveredDate.map { calendar.isDate($0, inSameDayAs: date) } ?? false
         let dayEvents = eventsForDate(date)
         let isWeekend = isWeekendColumn(columnIndex)
-        let highlightThisToday = isToday && settings.highlightToday
+        // Today is always highlighted — the per-user toggle was
+        // removed in favor of a sensible always-on default.
+        let highlightThisToday = isToday
 
         // Plain VStack + onTapGesture — using `Button { } label: { }` with
         // `.buttonStyle(.plain)` was sizing the cell to its label's natural
@@ -416,35 +436,53 @@ struct CalendarView: View {
                 calendarModule.selectedDate = date
             }
         }
+        .contextMenu {
+            // Right-click → create an event on this specific day.
+            // Defaults to 9 AM (we don't know the user's intent down
+            // to the minute; they can adjust in the quick-create input).
+            Button {
+                pendingCreateStart = CreateStart(date: defaultStart(on: date))
+            } label: {
+                Label("Create Event", systemImage: "plus.circle")
+            }
+        }
+    }
+
+    /// 9 AM on the given date (or the next round hour if the user
+    /// right-clicked on today during business hours, so the suggested
+    /// time isn't already in the past).
+    private func defaultStart(on day: Date) -> Date {
+        let cal = Calendar.current
+        if cal.isDateInToday(day) {
+            return defaultNewEventStart()
+        }
+        var comps = cal.dateComponents([.year, .month, .day], from: day)
+        comps.hour = 9
+        comps.minute = 0
+        return cal.date(from: comps) ?? day
     }
 
     private func dayNumberColor(isToday: Bool, isCurrentMonth: Bool, isWeekend: Bool) -> Color {
         if isToday { return .white }
         if !isCurrentMonth { return ForgeTheme.Colors.textMuted }
-        if isWeekend && settings.dimWeekends { return ForgeTheme.Colors.textMuted }
+        if isWeekend { return ForgeTheme.Colors.textMuted }
         return ForgeTheme.Colors.textPrimary
     }
 
+    /// Render the event-presence indicator for a day. Always uses
+    /// the multi-dot style (up to 3 colored circles, one per
+    /// distinct calendar) — the per-user "Event dots" picker used
+    /// to let people downgrade to a single dot or no dot at all,
+    /// but the multi-dot version conveys the most information
+    /// without taking more pixels, so it's now the only mode.
     @ViewBuilder
     private func eventDots(for events: [CalendarEvent]) -> some View {
-        switch settings.eventDotStyle {
-        case .none:
-            EmptyView()
-        case .single:
-            if !events.isEmpty {
+        HStack(spacing: 1.5) {
+            ForEach(events.prefix(3), id: \.id) { event in
                 Circle()
-                    .fill(events.first?.calendarColor ?? ForgeTheme.Colors.accent)
+                    .fill(event.calendarColor)
                     .frame(width: ForgeTheme.Layout.eventIndicatorSize,
                            height: ForgeTheme.Layout.eventIndicatorSize)
-            }
-        case .multiple:
-            HStack(spacing: 1.5) {
-                ForEach(events.prefix(3), id: \.id) { event in
-                    Circle()
-                        .fill(event.calendarColor)
-                        .frame(width: ForgeTheme.Layout.eventIndicatorSize,
-                               height: ForgeTheme.Layout.eventIndicatorSize)
-                }
             }
         }
     }
@@ -471,7 +509,7 @@ struct CalendarView: View {
                 // "+ ⌘N" inline create button — opens NewEventSheet on the
                 // currently selected date. Also bound to ⌘N globally while
                 // the popover is key.
-                Button(action: { creatingEvent = true }) {
+                Button(action: { pendingCreateStart = CreateStart(date: defaultNewEventStart()) }) {
                     HStack(spacing: 4) {
                         Image(systemName: "plus")
                             .font(.system(size: 9, weight: .semibold))
@@ -580,9 +618,10 @@ struct CalendarView: View {
             // Right-side action: Join button if meeting link + currently or soon
             if event.hasMeetingLink, isHappeningNow || isUpcoming {
                 Button {
-                    if let url = event.meetingURL {
-                        NSWorkspace.shared.open(url)
-                    }
+                    // Routes through MeetingLauncher.join() so the
+                    // reminder banner gets the .meetingJoined signal
+                    // and won't re-fire for this event.
+                    MeetingLauncher.join(event)
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "video.fill")
@@ -604,12 +643,32 @@ struct CalendarView: View {
         }
         .padding(.vertical, 8)
         .contentShape(Rectangle())
-        // Tap an event row → open the editor sheet (Google events only;
-        // EventKit events can't be round-tripped via Forge).
+        // Tap an event row → show the floating detail card (NOT the
+        // editor). The card's "Edit" button is the path to the
+        // editor sheet. This matches the full-calendar's behavior.
         .onTapGesture {
-            if event.isGoogleEvent {
-                editingEvent = event
-            }
+            detailEvent = event
+        }
+        // Attach the detail popover to each row so it anchors next to
+        // the event the user clicked.
+        .popover(
+            isPresented: Binding(
+                get: { detailEvent?.id == event.id },
+                set: { if !$0 { detailEvent = nil } }
+            ),
+            arrowEdge: .trailing
+        ) {
+            EventDetailCardPopover(
+                event: event,
+                onClose: { detailEvent = nil },
+                onEdit: {
+                    detailEvent = nil
+                    if event.isGoogleEvent {
+                        editingEvent = event
+                    }
+                }
+            )
+            .environmentObject(calendarModule)
         }
     }
 
@@ -637,19 +696,93 @@ struct CalendarView: View {
 
     // MARK: - World Clock Strip (Dot's sky strip at bottom)
 
+    /// Visible state for the world clock manager popover. Opened by
+    /// double-clicking the strip itself — no separate affordance, since
+    /// the strip is the only thing it could possibly act on.
+    @State private var worldClockManagerOpen: Bool = false
+    /// Manual horizontal scroll offset for the strip. Driven by a
+    /// `DragGesture` instead of a SwiftUI `ScrollView` — the latter
+    /// swallows scroll-wheel events inside the NSPopover and breaks
+    /// the parent's vertical scrolling (`MenuBarView` is wrapped in
+    /// `ScrollableContainer`, an NSScrollView shim that only works
+    /// when nothing above it captures wheel input).
+    @State private var clockStripOffset: CGFloat = 0
+    @State private var clockStripDragStart: CGFloat = 0
+    @State private var clockStripContentWidth: CGFloat = 0
+    @State private var clockStripVisibleWidth: CGFloat = 0
+
     private var worldClockStrip: some View {
-        HStack(spacing: ForgeTheme.Spacing.lg) {
-            ForEach(settings.worldClockCities) { city in
-                worldClockItem(city: city.label, timeZone: city.timeZone)
+        // Viewport: a `Color.clear` row that takes the full popover
+        // width but no more. The HStack of cities is drawn as an
+        // `.overlay` — overlays don't contribute to the parent's
+        // layout, so the row stays exactly the popover width even
+        // when the HStack inside is much wider. Anything past the
+        // edge is clipped and revealed only by dragging.
+        //
+        // We avoid SwiftUI's `ScrollView` because it swallows scroll-
+        // wheel events inside the NSPopover, which breaks the parent
+        // vertical scroller (`MenuBarView` is hosted in
+        // `ScrollableContainer`, an NSScrollView shim).
+        Color.clear
+            .frame(height: 22)
+            .frame(maxWidth: .infinity)
+            .background(
+                GeometryReader { geo in
+                    Color.clear
+                        .onAppear { clockStripVisibleWidth = geo.size.width }
+                        .onChange(of: geo.size.width) { w in clockStripVisibleWidth = w }
+                }
+            )
+            .overlay(alignment: .leading) {
+                HStack(spacing: ForgeTheme.Spacing.lg) {
+                    ForEach(settings.worldClockCities) { city in
+                        worldClockItem(city: city.label, timeZone: city.timeZone)
+                    }
+                    if settings.worldClockCities.isEmpty {
+                        Text("Double-click to add cities")
+                            .font(.system(size: 10))
+                            .foregroundColor(ForgeTheme.Colors.textMuted)
+                    }
+                }
+                .padding(.horizontal, ForgeTheme.Spacing.sm)
+                .fixedSize(horizontal: true, vertical: false)
+                .background(
+                    GeometryReader { contentGeo in
+                        Color.clear
+                            .onAppear { clockStripContentWidth = contentGeo.size.width }
+                            .onChange(of: contentGeo.size.width) { w in clockStripContentWidth = w }
+                    }
+                )
+                .offset(x: clockStripOffset)
             }
-            if settings.worldClockCities.isEmpty {
-                Text("No cities — add some in Settings → Calendar")
-                    .font(.system(size: 10))
-                    .foregroundColor(ForgeTheme.Colors.textMuted)
+            .clipped()
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 2)
+                    .onChanged { value in
+                        // Clamp to [-(content - visible), 0] so the
+                        // user can never drag past either edge. When
+                        // everything fits, both bounds collapse to 0
+                        // and the strip stays put.
+                        let overflow = max(0, clockStripContentWidth - clockStripVisibleWidth)
+                        let next = clockStripDragStart + value.translation.width
+                        clockStripOffset = min(0, max(-overflow, next))
+                    }
+                    .onEnded { _ in
+                        clockStripDragStart = clockStripOffset
+                    }
+            )
+            .onTapGesture(count: 2) {
+                worldClockManagerOpen = true
             }
-        }
-        .padding(.vertical, ForgeTheme.Spacing.sm)
-        .background(ForgeTheme.Colors.pageBgWarm)
+            .help("Drag to see more · double-click to reorder")
+            .padding(.top, ForgeTheme.Spacing.sm)
+            .padding(.bottom, 2)
+            .background(ForgeTheme.Colors.pageBgWarm)
+            .popover(isPresented: $worldClockManagerOpen, arrowEdge: .top) {
+                WorldClockManagerPopover()
+                    .environmentObject(settings)
+            }
     }
 
     private func worldClockItem(city: String, timeZone: TimeZone) -> some View {
@@ -745,7 +878,10 @@ struct CalendarView: View {
     }
 
     private func eventsForDate(_ date: Date) -> [CalendarEvent] {
-        calendarModule.events.filter { calendar.isDate($0.startDate, inSameDayAs: date) }
+        // Read from `activeEvents` so declined meetings don't appear
+        // in the menu-bar day list — same rule the ongoing/upcoming
+        // tokens follow.
+        calendarModule.activeEvents.filter { calendar.isDate($0.startDate, inSameDayAs: date) }
     }
 
     private func eventTimeString(_ event: CalendarEvent) -> String {

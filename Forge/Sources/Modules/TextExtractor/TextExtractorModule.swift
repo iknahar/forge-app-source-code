@@ -186,16 +186,6 @@ final class TextExtractorModule: ForgeModule, ObservableObject {
 
     // MARK: - Commands
 
-    func commands() -> [ForgeCommand] {
-        [
-            ForgeCommand(
-                id: "ocr.extract", title: "Extract Text (OCR)", subtitle: "Copy text from screen region",
-                iconName: "text.viewfinder", moduleId: id,
-                action: { [weak self] in self?.startExtracting() },
-                keywords: ["text", "extract", "ocr", "copy", "screen", "image", "read"]
-            ),
-        ]
-    }
 }
 
 // MARK: - Region Selector View

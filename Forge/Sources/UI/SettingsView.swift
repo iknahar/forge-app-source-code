@@ -38,37 +38,40 @@ struct SettingsView: View {
     @State private var selectedSection: SettingsSection = .general
 
     enum SettingsSection: String, CaseIterable, Identifiable {
-        case general    = "General"
-        case modules    = "Modules"
-        case calendar   = "Calendar"
-        case windows    = "Windows"
-        case menuBar    = "Menu Bar"
-        case shortcuts  = "Shortcuts"
-        case about      = "About"
+        case general      = "General"
+        case calendar     = "Calendar"
+        case eyeCare      = "Eye Care"
+        case launchers    = "Launchers"
+        case keyRemap     = "Key Remap"
+        case textExpander = "Text Expander"
+        case menuBar      = "Menu Bar"
+        case shortcuts    = "Shortcuts"
 
         var id: String { rawValue }
 
         var iconName: String {
             switch self {
-            case .general:    return "gearshape.fill"
-            case .modules:    return "square.grid.2x2.fill"
-            case .calendar:   return "calendar"
-            case .windows:    return "rectangle.split.3x1.fill"
-            case .menuBar:    return "menubar.rectangle"
-            case .shortcuts:  return "keyboard.fill"
-            case .about:      return "info.circle.fill"
+            case .general:      return "gearshape.fill"
+            case .calendar:     return "calendar"
+            case .eyeCare:      return "eye.fill"
+            case .launchers:    return "bolt.fill"
+            case .keyRemap:     return "keyboard"
+            case .textExpander: return "text.cursor"
+            case .menuBar:      return "menubar.rectangle"
+            case .shortcuts:    return "keyboard.fill"
             }
         }
 
         var subtitle: String {
             switch self {
-            case .general:    return "Appearance, time format, and startup behavior."
-            case .modules:    return "Enable or disable individual tools. Disabled modules consume zero CPU."
-            case .calendar:   return "Meeting reminders, focus signals, and connected calendars."
-            case .windows:    return "Snap zones, always-on-top borders, and workspace recall."
-            case .menuBar:    return "Compose what shows next to the hammer icon."
-            case .shortcuts:  return "Re-record any global hotkey. Changes register live."
-            case .about:      return "Local-first. No telemetry. No accounts."
+            case .general:      return "Appearance, time format, and startup behavior."
+            case .calendar:     return "Meeting reminders, focus signals, and connected calendars."
+            case .eyeCare:      return "20-20-20 breaks plus warm-tint screen filter to ease eye strain."
+            case .launchers:    return "Bind a shortcut to open any app, document, or URL."
+            case .keyRemap:     return "Remap any key combo to another, system-wide or per-app."
+            case .textExpander: return "Type a trigger, get an expansion. Like aText / TextExpander."
+            case .menuBar:      return "Compose what shows next to the hammer icon."
+            case .shortcuts:    return "Toggle, re-record, or disable any Forge action. Changes register live."
             }
         }
     }
@@ -87,6 +90,58 @@ struct SettingsView: View {
         }
     }
 
+    /// Description text for the "Fullscreen background" row. Shows
+    /// the currently-picked image filename (so the user can confirm
+    /// what's loaded) or the default-state hint when no custom image
+    /// is set. Living in the row's description slot — instead of as
+    /// a separate trailing Text — lets the action buttons sit in the
+    /// same column as the dropdowns above.
+    private var fullscreenBackgroundDescription: String {
+        if let path = settings.reminderBackgroundImagePath {
+            let name = URL(fileURLWithPath: path).lastPathComponent
+            return "Currently: \(name)"
+        }
+        return "Pick a wallpaper for the fullscreen alert."
+    }
+
+    /// Shared trailing-control width for the Meeting Reminders card —
+    /// every row's control container is this wide so all of them end
+    /// at the same X coordinate. Wide enough to fit "Full Screen" +
+    /// the chevron with breathing room, and to fit `Reset` + `Pick…`
+    /// side by side without overflow.
+    private static let reminderControlWidth: CGFloat = 150
+
+    /// Wrap a `Picker` so its menu button stretches to fill
+    /// `reminderControlWidth`. SwiftUI's `Picker(.menu)` ignores raw
+    /// `.frame(width:)` and shrinks to the selected text, which made
+    /// the two pickers in the Meeting Reminders card render at
+    /// different widths and at different right edges than the buttons
+    /// row. The combination here pushes the picker to fill the
+    /// container AND nudges the whole 14pt right so its visible
+    /// chevron lines up with the `Pick…` button below — the menu
+    /// button draws its rounded-rect chevron inset from its frame's
+    /// trailing edge by ~14pt, so the offset closes that gap.
+    @ViewBuilder
+    private func fixedWidthPicker<P: View>(@ViewBuilder content: () -> P) -> some View {
+        HStack(spacing: 0) {
+            // `Spacer()` here is SwiftUI's "space between" — pushes
+            // the picker to the trailing edge of the wrapper, the
+            // way flexbox `justify-content: space-between` does.
+            // Combined with the Picker's own `.frame(maxWidth: .infinity)`
+            // below, this makes the menu button stretch from the
+            // trailing edge inward.
+            Spacer(minLength: 0)
+            content()
+                .frame(maxWidth: .infinity)
+        }
+        .frame(width: Self.reminderControlWidth)
+        // Same trailing-nudge for every picker that uses this helper.
+        // Centralized here so both rows shift identically — earlier
+        // the offset was only on the second picker, which made the
+        // two visually out of step with each other.
+        .offset(x: 14)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // Top tab bar (replaces sidebar)
@@ -101,38 +156,55 @@ struct SettingsView: View {
 
             // Main split: settings (left) + preview (right)
             HStack(spacing: 0) {
-                // Settings content — NSScrollView-backed for reliable scroll wheel.
-                // .frame(maxWidth: .infinity) is critical so the scroll-view
-                // wrapper expands to fill the remaining HStack width instead of
-                // shrinking to its intrinsic 0pt size and getting clipped by
-                // the preview pane on the right.
-                ScrollableContainer {
-                    VStack(alignment: .leading, spacing: 24) {
-                        SectionHero(
-                            title: selectedSection.rawValue,
-                            subtitle: selectedSection.subtitle
-                        )
+                // Text Expander manages its own two-column scrolls
+                // internally — wrapping it in the parent NSScrollView
+                // gives it unbounded height, which makes the inner
+                // tree + detail scrolls never engage. Render it
+                // OUTSIDE the ScrollableContainer so its frame is
+                // exactly the window height, and the inner panes can
+                // each scroll within their bounds.
+                if selectedSection == .textExpander {
+                    textExpanderSettings
+                        .padding(.horizontal, 20)
+                        .padding(.top, 18)
+                        .padding(.bottom, 12)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        .background(ForgeTheme.Colors.pageBg)
+                } else {
+                    // Settings content — NSScrollView-backed for reliable scroll wheel.
+                    // .frame(maxWidth: .infinity) is critical so the scroll-view
+                    // wrapper expands to fill the remaining HStack width instead of
+                    // shrinking to its intrinsic 0pt size and getting clipped by
+                    // the preview pane on the right.
+                    ScrollableContainer {
+                        VStack(alignment: .leading, spacing: 24) {
+                            SectionHero(
+                                title: selectedSection.rawValue,
+                                subtitle: selectedSection.subtitle
+                            )
 
-                        Group {
-                            switch selectedSection {
-                            case .general:    generalSettings
-                            case .modules:    modulesSettings
-                            case .calendar:   calendarSettings
-                            case .windows:    windowSettings
-                            case .menuBar:    menuBarSettings
-                            case .shortcuts:  shortcutsSettings
-                            case .about:      aboutSection
+                            Group {
+                                switch selectedSection {
+                                case .general:      generalSettings
+                                case .calendar:     calendarSettings
+                                case .eyeCare:      eyeCareSettings
+                                case .launchers:    launchersSettings
+                                case .keyRemap:     keyRemapSettings
+                                case .textExpander: EmptyView()
+                                case .menuBar:      menuBarSettings
+                                case .shortcuts:    shortcutsSettings
+                                }
                             }
                         }
+                        // Tighter horizontal padding (was 28) so cards have more
+                        // room — the preview pane was eating into the content.
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 24)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    // Tighter horizontal padding (was 28) so cards have more
-                    // room — the preview pane was eating into the content.
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 24)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(ForgeTheme.Colors.pageBg)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(ForgeTheme.Colors.pageBg)
 
                 // Preview pane (right) — shown ONLY on the Calendar and
                 // Menu Bar tabs (the two surfaces where users actively
@@ -146,15 +218,21 @@ struct SettingsView: View {
                     }
                 }()
                 if showsPreview {
+                    // Calendar's mini-month grid + progress strips +
+                    // world-clock row need more horizontal room than
+                    // the Menu Bar pill does. We carve out an extra
+                    // 40pt for Calendar specifically; the left panel
+                    // shrinks correspondingly but its cards are all
+                    // fluid (`maxWidth: .infinity`) so none of the
+                    // controls clip. Overall window width is unchanged.
+                    let paneWidth: CGFloat = (selectedSection == .calendar) ? 320 : 280
                     SettingsPreviewPane(
                         section: selectedSection,
                         settings: settings,
                         moduleRegistry: moduleRegistry,
                         previewIsDark: $previewIsDark
                     )
-                    // Narrowed (was 320) so the settings content area gets
-                    // ~40pt more room — fixes World Clock / token chip clip.
-                    .frame(width: 280)
+                    .frame(width: paneWidth)
                     .background(ForgeTheme.Colors.pageBgWarm.opacity(0.6))
                     .overlay(
                         Rectangle()
@@ -196,8 +274,13 @@ struct SettingsView: View {
                 }
             }
 
+            // 2x2 layout: each card holds two SettingRows side by side
+            // instead of stacked vertically. More compact — the General
+            // tab now fits without scrolling, and the eye reads the
+            // related controls (24h + Launch) as one pair instead of
+            // two separate stops.
             SettingsCard(title: "Behavior") {
-                VStack(spacing: 14) {
+                HStack(alignment: .top, spacing: 18) {
                     SettingRow(
                         icon: "clock.fill",
                         iconTint: .blue,
@@ -209,8 +292,9 @@ struct SettingsView: View {
                             .labelsHidden()
                             .tint(ForgeTheme.Colors.accent)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
-                    Divider().opacity(0.3)
+                    Divider().frame(maxHeight: 56).opacity(0.3)
 
                     SettingRow(
                         icon: "power",
@@ -223,56 +307,108 @@ struct SettingsView: View {
                             .labelsHidden()
                             .tint(ForgeTheme.Colors.accent)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
+
+            // Screen Translator — defaults for the translate button in
+            // the screenshot toolbar. The on-the-fly chip there can still
+            // override these per-capture.
+            SettingsCard(
+                title: "Screen Translator",
+                titleIcon: "globe",
+                description: "When you press ⌃⌥S and click the globe button, Forge OCRs your selection and translates it. These are the default source / target languages — you can override them on the fly from the toolbar chip."
+            ) {
+                HStack(alignment: .top, spacing: 18) {
+                    SettingRow(
+                        icon: "text.viewfinder",
+                        iconTint: .indigo,
+                        title: "Detect text in",
+                        description: "Source language — pick \"Auto-detect\" to let Forge guess."
+                    ) {
+                        Picker("", selection: $settings.translateSourceLanguage) {
+                            ForEach(ScreenTranslator.supportedLanguages, id: \.code) { lang in
+                                Text(lang.label).tag(lang.code)
+                            }
+                        }
+                        .labelsHidden()
+                        // Narrower than the previous 200pt — needs to
+                        // share the row with the other Picker now.
+                        .frame(width: 140)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Divider().frame(maxHeight: 56).opacity(0.3)
+
+                    SettingRow(
+                        icon: "character.bubble.fill",
+                        iconTint: ForgeTheme.Colors.accent,
+                        title: "Translate to",
+                        description: "Target language for the translated output."
+                    ) {
+                        Picker("", selection: $settings.translateTargetLanguage) {
+                            ForEach(ScreenTranslator.supportedLanguages.filter { $0.code != "auto" },
+                                    id: \.code) { lang in
+                                Text(lang.label).tag(lang.code)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(width: 140)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+
+            // About footer — replaces the standalone About tab.
+            // Compact strip with the wordmark, version chip, tagline,
+            // and the three local-first promises.
+            aboutFooter
         }
     }
 
-    // MARK: - Modules
-
-    private var modulesSettings: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            // Stats summary card
-            let visible = moduleRegistry.modules.filter {
-                !["calendar", "commandPalette"].contains($0.id)
+    /// Small inline About strip rendered at the bottom of the
+    /// General settings page. Lifts the core pieces of the old
+    /// standalone About tab (logo, name, version, tagline, the
+    /// three "no telemetry / no accounts / local storage" facts)
+    /// without the 96pt hero treatment — this is a footer, not a
+    /// landing page.
+    private var aboutFooter: some View {
+        HStack(spacing: 14) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(ForgeTheme.Colors.accent.opacity(0.12))
+                    .frame(width: 36, height: 36)
+                Image(systemName: "hammer.fill")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundColor(ForgeTheme.Colors.accent)
+                    .rotationEffect(.degrees(-12))
             }
-            let totalModules = visible.count
-            let enabledCount = visible.filter { moduleRegistry.isEnabled($0.id) }.count
 
-            SettingsCard {
-                HStack(spacing: 20) {
-                    StatPill(value: "\(enabledCount)", label: "Active", tint: ForgeTheme.Colors.accent)
-                    StatPill(value: "\(totalModules - enabledCount)", label: "Disabled", tint: .secondary)
-                    StatPill(value: "\(totalModules)", label: "Total", tint: .blue)
-                    Spacer()
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 8) {
+                    Text("Forge")
+                        .font(.system(size: 14, weight: .bold))
+                    Text("v1.0.0")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(ForgeTheme.Colors.accent.opacity(0.15))
+                        .foregroundColor(ForgeTheme.Colors.accent)
+                        .clipShape(Capsule())
                 }
+                Text("Local-first. No telemetry. No accounts. Storage stays on your Mac.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
             }
 
-            // Hide core surfaces (Calendar, Command Palette) from the Modules
-            // list — those aren't user-toggleable utilities.
-            let hiddenIds: Set<String> = ["calendar", "commandPalette"]
-
-            ForEach(ModuleCategory.allCases) { category in
-                let categoryModules = moduleRegistry
-                    .modules(in: category)
-                    .filter { !hiddenIds.contains($0.id) }
-                if !categoryModules.isEmpty {
-                    SettingsCard(
-                        title: category.rawValue,
-                        titleIcon: category.iconName
-                    ) {
-                        VStack(spacing: 0) {
-                            ForEach(Array(categoryModules.enumerated()), id: \.element.id) { index, module in
-                                if index > 0 {
-                                    Divider().opacity(0.3)
-                                }
-                                ModuleRowSetting(module: module, registry: moduleRegistry)
-                            }
-                        }
-                    }
-                }
-            }
+            Spacer()
         }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: ForgeTheme.Radius.medium)
+                .fill(ForgeTheme.Colors.surfaceHover.opacity(0.45))
+        )
     }
 
     // MARK: - Calendar
@@ -312,32 +448,14 @@ struct SettingsView: View {
                         Toggle("", isOn: $settings.showWeekNumbers)
                             .toggleStyle(.forge).labelsHidden().tint(ForgeTheme.Colors.accent)
                     }
-                    Divider().opacity(0.3)
-                    SettingRow(icon: "circle.lefthalf.filled", iconTint: .yellow,
-                               title: "Highlight today",
-                               description: "Today's date gets the accent square.") {
-                        Toggle("", isOn: $settings.highlightToday)
-                            .toggleStyle(.forge).labelsHidden().tint(ForgeTheme.Colors.accent)
-                    }
-                    Divider().opacity(0.3)
-                    SettingRow(icon: "moon.zzz.fill", iconTint: .purple,
-                               title: "Dim weekends",
-                               description: "Saturdays and Sundays appear muted.") {
-                        Toggle("", isOn: $settings.dimWeekends)
-                            .toggleStyle(.forge).labelsHidden().tint(ForgeTheme.Colors.accent)
-                    }
-                    Divider().opacity(0.3)
-                    SettingRow(icon: "circle.dotted", iconTint: .red,
-                               title: "Event dots",
-                               description: "How busy days are marked in the grid.") {
-                        Picker("", selection: $settings.eventDotStyle) {
-                            ForEach(SettingsManager.EventDotStyle.allCases, id: \.self) { style in
-                                Text(style.rawValue).tag(style)
-                            }
-                        }
-                        .labelsHidden()
-                        .frame(width: 140)
-                    }
+                    // Highlight today / Dim weekends / Event-dot style
+                    // used to be three additional rows here. Removed —
+                    // those behaviors are now always-on with sensible
+                    // defaults: today is always highlighted, weekends
+                    // are always dimmed (using the trailing two columns
+                    // regardless of week-start), and event dots always
+                    // render in the multi-dot style. Less to fiddle
+                    // with, less to think about.
                     Divider().opacity(0.3)
                     SettingRow(icon: "calendar.day.timeline.left", iconTint: .pink,
                                title: "Week starts on",
@@ -368,12 +486,28 @@ struct SettingsView: View {
                 description: "Show a reminder before each meeting begins."
             ) {
                 VStack(spacing: 14) {
+                    // All three rows pin their trailing control inside
+                    // a `Self.reminderControlWidth`-pt container so the
+                    // right edges line up exactly. `fixedWidthPicker`
+                    // wraps a Picker in an HStack with a leading Spacer
+                    // — this forces the menu button to stretch to fill
+                    // the container's width (Picker(.menu) ignores raw
+                    // `.frame(width:)` and shrinks to content). The
+                    // buttons row uses the same trailing width so its
+                    // rightmost button sits at the identical X.
                     SettingRow(
                         icon: "clock.arrow.circlepath",
                         iconTint: .orange,
                         title: "Remind me",
                         description: "How far ahead the prompt appears."
                     ) {
+                        // 150pt frame goes directly on the Picker
+                        // itself (not on a wrapper HStack like the
+                        // Full Screen row uses) — so the picker is
+                        // the 150pt-wide child, trailing-aligned
+                        // inside the SettingRow's natural-width
+                        // parent. Plus a 1pt nudge to land its
+                        // chevron at the same X as the controls below.
                         Picker("", selection: $settings.meetingReminderMinutes) {
                             Text("At start").tag(0)
                             Text("1 min").tag(1)
@@ -382,7 +516,8 @@ struct SettingsView: View {
                             Text("15 min").tag(15)
                         }
                         .labelsHidden()
-                        .frame(width: 140)
+                        .frame(width: 150, alignment: .trailing)
+                        .offset(x: 1)
                     }
 
                     Divider().opacity(0.3)
@@ -393,45 +528,71 @@ struct SettingsView: View {
                         title: "Reminder style",
                         description: "How the prompt presents itself."
                     ) {
-                        Picker("", selection: $settings.meetingReminderStyle) {
-                            ForEach(SettingsManager.ReminderStyle.allCases, id: \.self) { style in
-                                Text(style.rawValue).tag(style)
+                        fixedWidthPicker {
+                            Picker("", selection: $settings.meetingReminderStyle) {
+                                ForEach(SettingsManager.ReminderStyle.allCases, id: \.self) { style in
+                                    Text(style.rawValue).tag(style)
+                                }
                             }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
                         }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
-                        .frame(width: 140)
                     }
 
                     // Full-screen background image picker — only meaningful
                     // when style is Full Screen; row still shows in both
                     // modes so the user can preset it.
+                    // Fullscreen background only matters when the
+                    // reminder style is `.fullscreen`. When the user
+                    // is on Floating, this row is greyed out and
+                    // non-interactive — but stays visible so the user
+                    // can see the option exists for the other style.
+                    let isFullScreen = settings.meetingReminderStyle == .fullscreen
                     Divider().opacity(0.3)
                     SettingRow(
                         icon: "photo.fill",
                         iconTint: .indigo,
                         title: "Fullscreen background",
-                        description: "Pick a wallpaper for the fullscreen alert."
+                        // The filename used to render to the right of
+                        // the buttons, which pushed Pick/Reset away
+                        // from the column the dropdowns above align
+                        // to. Surface it in the description instead
+                        // so the action buttons sit in the same
+                        // vertical column as the pickers.
+                        description: fullscreenBackgroundDescription
                     ) {
+                        // Same fixed-width trailing container as the
+                        // two pickers above. The buttons sit at the
+                        // right edge of this `reminderControlWidth`
+                        // box; the Pick button is custom-styled at the
+                        // exact same height as the Pickers (~22pt) so
+                        // the visual row reads as a uniform column.
                         HStack(spacing: 6) {
-                            Text(settings.reminderBackgroundImagePath
-                                 .flatMap { URL(fileURLWithPath: $0).lastPathComponent }
-                                 ?? "Default stripes")
-                                .font(.system(size: 11))
-                                .foregroundColor(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                                .frame(maxWidth: 140, alignment: .trailing)
-                            Button("Pick…") { pickReminderBackground() }
-                                .controlSize(.small)
                             if settings.reminderBackgroundImagePath != nil {
                                 Button("Reset") {
                                     settings.reminderBackgroundImagePath = nil
                                 }
-                                .controlSize(.small)
                             }
+                            Button { pickReminderBackground() } label: {
+                                Text("Pick…")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 11)
+                                    .padding(.vertical, 4)
+                            }
+                            .background(ForgeTheme.Colors.accent)
+                            .clipShape(RoundedRectangle(cornerRadius: 5))
+                            .buttonStyle(.plain)
                         }
+                        .frame(width: Self.reminderControlWidth, alignment: .trailing)
                     }
+                    // Grey out + block clicks when the user has picked
+                    // Floating — there's no fullscreen surface to put a
+                    // background image on in that mode. The row stays
+                    // visible so the option is discoverable, just
+                    // visibly inert.
+                    .disabled(!isFullScreen)
+                    .opacity(isFullScreen ? 1 : 0.45)
                 }
             }
 
@@ -449,97 +610,71 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Command Bar
 
-    private var commandBarSettings: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            // Big hero card showcasing the feature, à la Dot
-            SettingsCard {
-                VStack(alignment: .leading, spacing: 16) {
-                    HStack(spacing: 12) {
-                        Image(systemName: "magnifyingglass")
-                            .font(.system(size: 18, weight: .semibold))
-                            .foregroundColor(ForgeTheme.Colors.accent)
-                            .frame(width: 36, height: 36)
-                            .background(ForgeTheme.Colors.accent.opacity(0.15))
-                            .clipShape(RoundedRectangle(cornerRadius: 9))
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Spotlight, for Forge.")
-                                .font(.system(size: 16, weight: .semibold))
-                            Text("Search, create, and manage events in one combo.")
-                                .font(.system(size: 12))
-                                .foregroundColor(.secondary)
-                        }
-                        Spacer()
-                        ShortcutPill(text: settings.binding(for: "commandPalette").displayString)
-                    }
+    // MARK: - Key Remap
 
-                    HStack(spacing: 10) {
-                        FeaturePill(icon: "command", label: "Launch from anywhere")
-                        FeaturePill(icon: "text.cursor", label: "Natural input")
-                        FeaturePill(icon: "globe", label: "World clock")
-                    }
-                }
-            }
-
-            SettingsCard(
-                title: "Behavior",
-                description: "Change the keybinding in Shortcuts → Command Bar."
-            ) {
-                SettingRow(
-                    icon: "rectangle.dashed",
-                    iconTint: .indigo,
-                    title: "Show on all spaces",
-                    description: "Floating palette ignores Mission Control spaces."
-                ) {
-                    Toggle("", isOn: .constant(true))
-                        .toggleStyle(.forge)
-                        .labelsHidden()
-                        .tint(ForgeTheme.Colors.accent)
-                }
+    /// Settings panel for the Key Remap module — lets the user view
+    /// existing key→key mappings, toggle them, delete them, and add new
+    /// ones via a capture sheet. The actual remapping logic lives in
+    /// `KeyRemapModule` (a CGEventTap that's already running); this UI
+    /// just CRUDs the `remappings` array on the module.
+    /// Eye Care settings page — combined Pomodoro/20-20-20 timer
+    /// plus screen-filter (color temp + brightness) controls. Lives
+    /// inside `EyeCareSettingsView`; this wrapper just locates the
+    /// live module instance from the registry and degrades gracefully
+    /// if it's not present (shouldn't happen in production, but the
+    /// fallback keeps the page from crashing in previews).
+    private var eyeCareSettings: some View {
+        Group {
+            if let module = moduleRegistry.module(ofType: EyeCareModule.self) {
+                EyeCareSettingsView(module: module)
+            } else {
+                Text("Eye Care module is not registered.")
+                    .foregroundColor(.secondary)
             }
         }
     }
 
-    // MARK: - Windows
-
-    private var windowSettings: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            SettingsCard(
-                title: "Snap Zones",
-                titleIcon: "rectangle.split.3x1.fill",
-                description: "Hold the modifier while dragging a window to snap it."
-            ) {
-                SettingRow(
-                    icon: "keyboard",
-                    iconTint: .teal,
-                    title: "Snap modifier",
-                    description: "Pick a modifier that doesn't conflict with your workflow."
-                ) {
-                    ForgeSegmentedPicker(
-                        selection: $settings.windowSnapModifier,
-                        options: SettingsManager.SnapModifier.allCases.map {
-                            (label: $0.rawValue, value: $0)
-                        }
-                    )
-                    .frame(width: 220)
-                }
+    /// Launchers settings page — list of user-defined shortcuts
+    /// bound to app / document / URL targets.
+    private var launchersSettings: some View {
+        Group {
+            if let module = moduleRegistry.module(ofType: LaunchersModule.self) {
+                LaunchersSettingsView(module: module)
+            } else {
+                Text("Launchers module is not registered.")
+                    .foregroundColor(.secondary)
             }
+        }
+    }
 
-            SettingsCard(
-                title: "Always On Top",
-                titleIcon: "pin.fill",
-                description: "Pinned windows show a colored border."
-            ) {
-                SettingRow(
-                    icon: "paintbrush.fill",
-                    iconTint: .red,
-                    title: "Border color",
-                    description: "Visible accent for any window kept on top."
-                ) {
-                    ColorPicker("", selection: .constant(ForgeTheme.Colors.accent))
-                        .labelsHidden()
-                }
+    private var keyRemapSettings: some View {
+        // Look up the module from the registry. We render the UI lazily
+        // and gracefully degrade if KeyRemap isn't registered for some
+        // reason (e.g. user disabled it via the Modules tab).
+        Group {
+            if let module = moduleRegistry.module(ofType: KeyRemapModule.self) {
+                KeyRemapEditor(module: module)
+            } else {
+                Text("Key Remap module is unavailable.")
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+
+    // MARK: - Text Expander
+
+    /// Settings panel for the Text Expander module. Same pattern as
+    /// Key Remap above — look up the module lazily, render its
+    /// dedicated SwiftUI editor, fall back to a placeholder if it
+    /// isn't registered.
+    private var textExpanderSettings: some View {
+        Group {
+            if let module = moduleRegistry.module(ofType: TextExpanderModule.self) {
+                TextExpanderSettingsView(module: module)
+            } else {
+                Text("Text Expander module is unavailable.")
+                    .foregroundColor(.secondary)
             }
         }
     }
@@ -585,21 +720,37 @@ struct SettingsView: View {
 
     private var shortcutsSettings: some View {
         VStack(alignment: .leading, spacing: 20) {
-            SettingsCard(
-                title: "Global Shortcuts",
-                titleIcon: "keyboard.fill",
-                description: "Click a binding to record a new combo. Press Escape to cancel."
-            ) {
-                VStack(spacing: 0) {
-                    ForEach(Array(ShortcutBinding.allActions.enumerated()), id: \.element.id) { index, action in
-                        if index > 0 {
-                            Divider().opacity(0.3)
+            // Lead-in helper — each row in the cards below has its
+            // own description, so we only need a single overall hint.
+            HStack(spacing: 6) {
+                Image(systemName: "keyboard.fill")
+                    .font(.system(size: 11))
+                    .foregroundColor(ForgeTheme.Colors.textSecondary)
+                Text("Toggle to enable / disable. Click a binding to record a new combo, Escape to cancel. Gesture rows show their built-in trigger.")
+                    .font(.system(size: 11))
+                    .foregroundColor(ForgeTheme.Colors.textSecondary)
+            }
+            .padding(.horizontal, 4)
+
+            // One card per group — gestures live inline in their own
+            // group's card so related actions stay together. Empty
+            // groups are skipped so we don't show ghost cards if a
+            // group's actions are ever removed.
+            ForEach(ShortcutBinding.ShortcutGroup.allCases) { group in
+                let actions = ShortcutBinding.actions(in: group)
+                if !actions.isEmpty {
+                    SettingsCard(
+                        title: group.rawValue,
+                        titleIcon: group.iconName
+                    ) {
+                        VStack(spacing: 0) {
+                            ForEach(Array(actions.enumerated()), id: \.element.id) { index, action in
+                                if index > 0 {
+                                    Divider().opacity(0.3)
+                                }
+                                ShortcutRow(action: action, settings: settings)
+                            }
                         }
-                        ShortcutRow(
-                            actionName: action.name,
-                            actionId: action.id,
-                            settings: settings
-                        )
                     }
                 }
             }
@@ -627,49 +778,6 @@ struct SettingsView: View {
 
     // MARK: - About
 
-    private var aboutSection: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            SettingsCard {
-                VStack(spacing: 18) {
-                    ZStack {
-                        Circle()
-                            .fill(ForgeTheme.Colors.accent.opacity(0.12))
-                            .frame(width: 96, height: 96)
-                        Image(systemName: "hammer.fill")
-                            .font(.system(size: 44, weight: .semibold))
-                            .foregroundColor(ForgeTheme.Colors.accent)
-                    }
-
-                    VStack(spacing: 6) {
-                        HStack(spacing: 8) {
-                            Text("Forge")
-                                .font(.system(size: 26, weight: .bold))
-                            Text("v1.0.0")
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 3)
-                                .background(ForgeTheme.Colors.accent.opacity(0.15))
-                                .foregroundColor(ForgeTheme.Colors.accent)
-                                .clipShape(Capsule())
-                        }
-                        Text("Your desktop. Supercharged.")
-                            .font(.system(size: 14))
-                            .foregroundColor(.secondary)
-                    }
-
-                    Divider().opacity(0.3)
-
-                    HStack(spacing: 16) {
-                        AboutFact(icon: "lock.shield.fill", value: "Local", label: "Storage")
-                        AboutFact(icon: "eye.slash.fill", value: "Zero", label: "Telemetry")
-                        AboutFact(icon: "person.fill.xmark", value: "None", label: "Accounts")
-                    }
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 12)
-            }
-        }
-    }
 }
 
 // MARK: - Top Tab Bar
@@ -757,7 +865,12 @@ private struct SettingsPreviewPane: View {
     @Binding var previewIsDark: Bool
 
     var body: some View {
-        VStack(spacing: 0) {
+        // Calendar gets a bit more breathing room: the mini-month grid
+        // needs about 280pt of pure card real estate, plus 20pt of
+        // padding on each side so it doesn't touch the pane edges.
+        let horizontalPadding: CGFloat = (section == .calendar) ? 22 : 18
+
+        return VStack(spacing: 0) {
             // Header — just the "PREVIEW" label; previews always follow the
             // app's actual theme (no separate sun/moon override).
             HStack {
@@ -768,7 +881,7 @@ private struct SettingsPreviewPane: View {
                     .tracking(0.8)
                 Spacer()
             }
-            .padding(.horizontal, 18)
+            .padding(.horizontal, horizontalPadding)
             .padding(.top, 18)
             .padding(.bottom, 14)
 
@@ -777,16 +890,17 @@ private struct SettingsPreviewPane: View {
             // the whole pane (no centered pills with cut edges).
             VStack(alignment: .leading, spacing: 14) {
                 switch section {
-                case .general:    GeneralPreview(settings: settings, isDark: previewIsDark)
-                case .modules:    ModulesPreview(registry: moduleRegistry, isDark: previewIsDark)
-                case .calendar:   CalendarPreviewCard(settings: settings, isDark: previewIsDark)
-                case .windows:    WindowsPreview(isDark: previewIsDark)
-                case .menuBar:    MenuBarPreview(settings: settings, isDark: previewIsDark)
-                case .shortcuts:  ShortcutsPreview(settings: settings, isDark: previewIsDark)
-                case .about:      AboutPreview(isDark: previewIsDark)
+                case .general:      GeneralPreview(settings: settings, isDark: previewIsDark)
+                case .calendar:     CalendarPreviewCard(settings: settings, isDark: previewIsDark)
+                case .eyeCare:      EmptyView()
+                case .launchers:    EmptyView()
+                case .keyRemap:     EmptyView()
+                case .textExpander: EmptyView()
+                case .menuBar:      MenuBarPreview(settings: settings, isDark: previewIsDark)
+                case .shortcuts:    ShortcutsPreview(settings: settings, isDark: previewIsDark)
                 }
             }
-            .padding(.horizontal, 18)
+            .padding(.horizontal, horizontalPadding)
             .frame(maxWidth: .infinity, alignment: .leading)
             .transition(.opacity)
             .animation(.easeOut(duration: 0.15), value: section)
@@ -807,12 +921,17 @@ private struct SettingsPreviewPane: View {
 /// Common card wrapper for the preview content. Uses the adaptive
 /// `surfaceCard` token so it stays visually consistent with the rest of the
 /// Settings window regardless of the preview's sun/moon toggle.
+///
+/// The card stretches to fill the preview pane width (minus the pane's
+/// own horizontal padding) instead of being locked at a fixed 280pt
+/// — that way the Calendar tab's wider pane gives the mini-month grid
+/// the room it needs without leaving an awkward gutter on the right.
 private struct PreviewCard<Content: View>: View {
     let isDark: Bool
     @ViewBuilder var content: () -> Content
     var body: some View {
         content()
-            .frame(width: 280)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
                     .fill(ForgeTheme.Colors.surfaceCard)
@@ -860,55 +979,16 @@ private struct GeneralPreview: View {
     }
 }
 
-private struct ModulesPreview: View {
-    @ObservedObject var registry: ModuleRegistry
-    let isDark: Bool
-    var body: some View {
-        let enabled = registry.modules.filter { registry.isEnabled($0.id) }.count
-        let total = registry.modules.count
-        return PreviewCard(isDark: isDark) {
-            VStack(spacing: 14) {
-                HStack(spacing: 0) {
-                    statBlock(value: "\(enabled)", label: "Active", tint: ForgeTheme.Colors.accent)
-                    Divider().frame(height: 36).opacity(0.2)
-                    statBlock(value: "\(total - enabled)", label: "Off", tint: .secondary)
-                    Divider().frame(height: 36).opacity(0.2)
-                    statBlock(value: "\(total)", label: "Total", tint: .blue)
-                }
-                Divider().opacity(0.2)
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(registry.modules.prefix(4), id: \.id) { module in
-                        HStack(spacing: 8) {
-                            Image(systemName: module.iconName)
-                                .font(.system(size: 10))
-                                .foregroundColor(registry.isEnabled(module.id) ? ForgeTheme.Colors.accent : .secondary)
-                                .frame(width: 16)
-                            Text(module.name)
-                                .font(.system(size: 11))
-                                .foregroundColor(isDark ? .white : .primary)
-                            Spacer()
-                            Circle()
-                                .fill(registry.isEnabled(module.id) ? ForgeTheme.Colors.accent : Color.gray.opacity(0.3))
-                                .frame(width: 6, height: 6)
-                        }
-                    }
-                }
-            }
-            .padding(16)
-        }
-    }
-    private func statBlock(value: String, label: String, tint: Color) -> some View {
-        VStack(spacing: 2) {
-            Text(value).font(.system(size: 20, weight: .bold, design: .rounded)).foregroundColor(tint)
-            Text(label.uppercased()).font(.system(size: 9, weight: .semibold))
-                .tracking(0.5).foregroundColor(.secondary)
-        }.frame(maxWidth: .infinity)
-    }
-}
 
 private struct CalendarPreviewCard: View {
     @ObservedObject var settings: SettingsManager
     let isDark: Bool
+    /// Real system color scheme — the `isDark` param is a leftover from
+    /// when the preview had a sun/moon toggle. We now follow the actual
+    /// app theme so the pill blends with the rest of the Settings
+    /// window instead of glowing white in dark mode.
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
         VStack(spacing: 8) {
             // Mini menu bar
@@ -916,17 +996,25 @@ private struct CalendarPreviewCard: View {
                 if settings.menuBarEmoji.isEmpty {
                     Image(systemName: "hammer.fill")
                         .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(isDark ? .white : .primary)
+                        .foregroundColor(ForgeTheme.Colors.textPrimary)
                 } else {
                     Text(settings.menuBarEmoji).font(.system(size: 11))
                 }
                 Text(menuBarText)
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundColor(isDark ? .white : .primary)
+                    .foregroundColor(ForgeTheme.Colors.textPrimary)
             }
             .padding(.horizontal, 10).padding(.vertical, 4)
-            .background(Capsule().fill(isDark ? Color.black.opacity(0.6) : Color.white)
-                .shadow(color: .black.opacity(0.08), radius: 4, y: 1))
+            .background(
+                Capsule().fill(ForgeTheme.Colors.surfaceCard)
+                    .shadow(
+                        color: .black.opacity(colorScheme == .dark ? 0.35 : 0.08),
+                        radius: 4, y: 1
+                    )
+            )
+            .overlay(
+                Capsule().strokeBorder(ForgeTheme.Colors.borderDefault, lineWidth: 0.5)
+            )
 
             PreviewCard(isDark: isDark) {
                 MiniCalendarPreview(settings: settings, isDark: isDark)
@@ -940,71 +1028,13 @@ private struct CalendarPreviewCard: View {
     }
 }
 
-private struct CommandBarPreview: View {
-    @ObservedObject var settings: SettingsManager
-    let isDark: Bool
-    var body: some View {
-        PreviewCard(isDark: isDark) {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 8) {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundColor(.secondary)
-                    Text("Type a command…")
-                        .foregroundColor(.secondary)
-                    Spacer()
-                    Text(settings.binding(for: "commandPalette").displayString)
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(.secondary)
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(Capsule().fill(Color.black.opacity(0.05)))
-                }
-                .font(.system(size: 12))
-                .padding(.horizontal, 14).padding(.vertical, 12)
-
-                Divider().opacity(0.15)
-                ForEach(["Copy today's agenda", "Open Color Picker", "Window: snap left"], id: \.self) { item in
-                    HStack {
-                        Text(item).font(.system(size: 11)).foregroundColor(isDark ? .white : .primary)
-                        Spacer()
-                    }
-                    .padding(.horizontal, 14).padding(.vertical, 8)
-                }
-            }
-        }
-    }
-}
-
-private struct WindowsPreview: View {
-    let isDark: Bool
-    var body: some View {
-        PreviewCard(isDark: isDark) {
-            VStack(spacing: 8) {
-                Text("Snap Zones — Two Columns")
-                    .font(.system(size: 10, weight: .semibold))
-                    .tracking(0.4)
-                    .foregroundColor(.secondary)
-                HStack(spacing: 6) {
-                    zoneRect()
-                    zoneRect()
-                }
-                .frame(height: 110)
-            }.padding(14)
-        }
-    }
-    private func zoneRect() -> some View {
-        RoundedRectangle(cornerRadius: 8)
-            .fill(ForgeTheme.Colors.accent.opacity(0.12))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(ForgeTheme.Colors.accent.opacity(0.5),
-                            style: StrokeStyle(lineWidth: 1, dash: [4]))
-            )
-    }
-}
-
 private struct MenuBarPreview: View {
     @ObservedObject var settings: SettingsManager
     let isDark: Bool
+    /// Follow the real app theme — see `CalendarPreviewCard` for why
+    /// the `isDark` param is no longer enough.
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
         // Left-aligned, full-width preview card. Content inside the pill
         // can wrap to a second line via lineLimit(nil) so a wide token list
@@ -1025,7 +1055,7 @@ private struct MenuBarPreview: View {
                 }
                 Text(tokenLine)
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundColor(isDark ? .white : .primary)
+                    .foregroundColor(ForgeTheme.Colors.textPrimary)
                     .lineLimit(2)
                     .truncationMode(.tail)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1035,8 +1065,15 @@ private struct MenuBarPreview: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 18)
-                    .fill(isDark ? Color.black.opacity(0.6) : Color.white)
-                    .shadow(color: .black.opacity(0.1), radius: 6, y: 2)
+                    .fill(ForgeTheme.Colors.surfaceCard)
+                    .shadow(
+                        color: .black.opacity(colorScheme == .dark ? 0.35 : 0.1),
+                        radius: 6, y: 2
+                    )
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 18)
+                    .strokeBorder(ForgeTheme.Colors.borderDefault, lineWidth: 0.5)
             )
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1054,21 +1091,22 @@ private struct MenuBarPreview: View {
     private func tokenSample(_ token: SettingsManager.MenuBarToken) -> String {
         let now = Date()
         switch token {
-        case .icon:         return ""
-        case .date:         let f = DateFormatter(); f.dateFormat = "EEE, MMM d"; return f.string(from: now)
-        case .clock:        let f = DateFormatter(); f.dateFormat = settings.menuBarTimeFormat; return f.string(from: now)
-        case .nextEvent:    return "Standup · 12m"
-        case .countdown:    return "12m"
+        case .icon:            return ""
+        case .date:            let f = DateFormatter(); f.dateFormat = "EEE, MMM d"; return f.string(from: now)
+        case .clock:           let f = DateFormatter(); f.dateFormat = settings.menuBarTimeFormat; return f.string(from: now)
+        case .ongoingMeeting:  return "● Design Review · 23m left"
+        case .nextEvent:       return "Standup · 12m"
+        case .countdown:       return "12m"
         case .weekNumber:
             var c = Calendar(identifier: .iso8601)
             c.firstWeekday = settings.weekStartsOnMonday ? 2 : 1
             return "W\(c.component(.weekOfYear, from: now))"
-        case .dayProgress:  return "57%"
-        case .yearProgress: return "32%"
-        case .worldClock:   return "STK 14:34"
-        case .timeLeft:     return "23m left"
-        case .eventsLeft:   return "3 left"
-        case .focusTime:    return "2h focus"
+        case .dayProgress:     return "57%"
+        case .yearProgress:    return "32%"
+        case .worldClock:      return "STK 14:34"
+        case .timeLeft:        return "23m left"
+        case .eventsLeft:      return "3 left"
+        case .focusTime:       return "2h focus"
         }
     }
 }
@@ -1140,9 +1178,19 @@ private struct PreviewModeChip: View {
 private struct MiniCalendarPreview: View {
     @ObservedObject var settings: SettingsManager
     let isDark: Bool
+    /// Real system color scheme — the `isDark` parameter is a leftover
+    /// from when the preview pane had its own sun/moon toggle. The
+    /// preview now follows the actual app theme so day numbers stay
+    /// readable on a dark surface.
+    @Environment(\.colorScheme) private var colorScheme
 
-    private var fg: Color { isDark ? .white : Color(white: 0.1) }
-    private var fgMuted: Color { isDark ? Color.white.opacity(0.5) : Color(white: 0.45) }
+    private var fg: Color { ForgeTheme.Colors.textPrimary }
+    private var fgMuted: Color { ForgeTheme.Colors.textTertiary }
+    private var fgFaint: Color {
+        colorScheme == .dark
+            ? Color.white.opacity(0.22)
+            : Color.black.opacity(0.22)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1170,32 +1218,37 @@ private struct MiniCalendarPreview: View {
                 ForEach(Array(headers.enumerated()), id: \.offset) { idx, d in
                     Text(d)
                         .font(.system(size: 9, weight: .medium))
-                        .foregroundColor(isWeekendIdx(idx) && settings.dimWeekends ? fgMuted.opacity(0.6) : fgMuted)
+                        .foregroundColor(isWeekendIdx(idx) ? fgMuted.opacity(0.6) : fgMuted)
                         .frame(maxWidth: .infinity)
                 }
             }
 
-            // Sample week with today highlighted
-            HStack(spacing: 0) {
-                ForEach(0..<7, id: \.self) { idx in
-                    let day = sampleDay(idx)
-                    let isToday = idx == 3
-                    ZStack {
-                        if isToday && settings.highlightToday {
-                            RoundedRectangle(cornerRadius: 5)
-                                .fill(ForgeTheme.Colors.accent)
-                                .frame(width: 22, height: 22)
+            // Full month grid — 6 rows × 7 columns of the current month.
+            // Out-of-month days are dimmed so the focus stays on the
+            // current month while the grid still reads as a real
+            // calendar (matches the popover behavior).
+            ForEach(monthRows.indices, id: \.self) { rowIdx in
+                HStack(spacing: 0) {
+                    ForEach(0..<7, id: \.self) { colIdx in
+                        let day = monthRows[rowIdx][colIdx]
+                        let isToday = calendar.isDateInToday(day.date)
+                        ZStack {
+                            // Today is always highlighted now — the
+                            // toggle for it was removed in favor of
+                            // an always-on default.
+                            if isToday {
+                                RoundedRectangle(cornerRadius: 5)
+                                    .fill(ForgeTheme.Colors.accent)
+                                    .frame(width: 22, height: 22)
+                            }
+                            Text("\(calendar.component(.day, from: day.date))")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(dayColor(day: day, colIdx: colIdx, isToday: isToday))
                         }
-                        Text(day)
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(isToday && settings.highlightToday
-                                             ? .white
-                                             : (isWeekendIdx(idx) && settings.dimWeekends ? fgMuted : fg))
+                        .frame(maxWidth: .infinity, minHeight: 22)
                     }
-                    .frame(maxWidth: .infinity)
                 }
             }
-            .padding(.vertical, 2)
 
             // World clock — single horizontal row, compact (matches popover).
             // Limited to 2 cities in the preview so labels never wrap inside
@@ -1238,13 +1291,65 @@ private struct MiniCalendarPreview: View {
         }
     }
 
+    /// Weekend = the last two columns of the displayed week,
+    /// regardless of week-start. So:
+    ///   • Week starts Mon → columns are [Mon..Sun] → weekend = Sat+Sun
+    ///   • Week starts Sun → columns are [Sun..Sat] → weekend = Fri+Sat
+    /// The second case matches the South-Asia / Middle-East working
+    /// week (Sun = first working day, Fri+Sat off).
     private func isWeekendIdx(_ i: Int) -> Bool {
-        settings.weekStartsOnMonday ? (i == 5 || i == 6) : (i == 0 || i == 6)
+        i == 5 || i == 6
     }
 
-    private func sampleDay(_ idx: Int) -> String {
-        // Just numbers 10..16 for a representative week
-        "\(10 + idx)"
+    private var calendar: Calendar {
+        var c = Calendar.current
+        c.firstWeekday = settings.weekStartsOnMonday ? 2 : 1
+        return c
+    }
+
+    /// One cell in the mini month grid — the underlying date plus a
+    /// flag for "is this in the displayed month or a neighbouring
+    /// month's overflow day".
+    private struct DayCell {
+        let date: Date
+        let isCurrentMonth: Bool
+    }
+
+    /// 6 rows of 7 days each, anchored to today's month. The leading
+    /// edge is back-filled with the previous month's tail days so the
+    /// grid always starts on the user's chosen weekday.
+    private var monthRows: [[DayCell]] {
+        let now = Date()
+        let monthStart = calendar.date(from: calendar.dateComponents([.year, .month], from: now)) ?? now
+        let weekday = calendar.component(.weekday, from: monthStart)
+        let leading: Int
+        if settings.weekStartsOnMonday {
+            leading = (weekday + 5) % 7
+        } else {
+            leading = (weekday - 1) % 7
+        }
+        let firstCell = calendar.date(byAdding: .day, value: -leading, to: monthStart) ?? monthStart
+        let displayedMonth = calendar.component(.month, from: now)
+        var rows: [[DayCell]] = []
+        for row in 0..<6 {
+            var cells: [DayCell] = []
+            for col in 0..<7 {
+                let d = calendar.date(byAdding: .day, value: row * 7 + col, to: firstCell) ?? firstCell
+                cells.append(DayCell(
+                    date: d,
+                    isCurrentMonth: calendar.component(.month, from: d) == displayedMonth
+                ))
+            }
+            rows.append(cells)
+        }
+        return rows
+    }
+
+    private func dayColor(day: DayCell, colIdx: Int, isToday: Bool) -> Color {
+        if isToday { return .white }
+        if !day.isCurrentMonth { return fgFaint }
+        if isWeekendIdx(colIdx) { return fgMuted }
+        return fg
     }
 
     private var yearProgress: Double {
@@ -1344,7 +1449,10 @@ private struct SectionHero: View {
 
 // MARK: - Card
 
-private struct SettingsCard<Content: View>: View {
+// Made internal (was private) so module-specific Settings views in
+// other files (e.g. `TextExpanderSettingsView`) can reuse the same
+// card chrome without re-implementing the styling.
+struct SettingsCard<Content: View>: View {
     var title: String? = nil
     var titleIcon: String? = nil
     var description: String? = nil
@@ -1429,16 +1537,38 @@ private struct ModuleRowSetting: View {
     @ObservedObject var registry: ModuleRegistry
     @EnvironmentObject var settings: SettingsManager
 
+    /// Hover state for the clickable-icon affordance. Local to this
+    /// row so multiple rows don't fight over a single source.
+    @State private var iconHovering = false
+
     var body: some View {
         let enabled = registry.isEnabled(module.id)
         let shortcut = shortcutForModule(id: module.id)
+        let triggerable = Self.appDelegate?.hasPrimaryAction(forModuleId: module.id) ?? false
+
         return HStack(alignment: .center, spacing: 10) {
-            Image(systemName: module.iconName)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(enabled ? ForgeTheme.Colors.accent : .secondary)
-                .frame(width: 24, height: 24)
-                .background((enabled ? ForgeTheme.Colors.accent : Color.gray).opacity(0.12))
-                .clipShape(RoundedRectangle(cornerRadius: 6))
+            // Icon: clickable button on modules with a primary action,
+            // a plain image otherwise. The Toggle on the right is a
+            // separate control so the user can enable/disable the
+            // module without ever firing it (your "separately
+            // clickable" requirement).
+            if triggerable {
+                // Plain `.onTapGesture` + `.onHover` instead of a
+                // SwiftUI `Button` — the Tools panel embeds inside an
+                // NSScrollView-backed scroll container, and Button's
+                // hit-test tracking swallows scroll-wheel events on
+                // macOS. The bare gestures give us the same click
+                // behavior without breaking scroll.
+                iconView(enabled: enabled, hovering: iconHovering)
+                    .contentShape(Rectangle())
+                    .onHover { iconHovering = $0 }
+                    .onTapGesture {
+                        _ = Self.appDelegate?.triggerPrimaryAction(forModuleId: module.id)
+                    }
+                    .help("Run \(module.name)")
+            } else {
+                iconView(enabled: enabled, hovering: false)
+            }
 
             Text(module.name)
                 .font(.system(size: 12, weight: .medium))
@@ -1470,19 +1600,59 @@ private struct ModuleRowSetting: View {
         .padding(.vertical, 5)
     }
 
+    /// The square icon chip. Pulled out so the triggerable / static
+    /// branches above share the exact same visual.
+    @ViewBuilder
+    private func iconView(enabled: Bool, hovering: Bool) -> some View {
+        Image(systemName: module.iconName)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundColor(enabled ? ForgeTheme.Colors.accent : .secondary)
+            .frame(width: 24, height: 24)
+            // Background brightens slightly on hover so the user gets
+            // a hint that the chip is clickable. Static rows keep the
+            // base tint forever.
+            .background(
+                (enabled ? ForgeTheme.Colors.accent : Color.gray)
+                    .opacity(hovering ? 0.22 : 0.12)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            // Thin accent ring on hover — the "this is clickable"
+            // signal. Drawn on top of the background so it's visible
+            // against either fill color.
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(
+                        hovering ? ForgeTheme.Colors.accent.opacity(0.65) : Color.clear,
+                        lineWidth: 1
+                    )
+            )
+            // A barely-there scale bump reinforces the affordance.
+            .scaleEffect(hovering ? 1.08 : 1.0)
+            .animation(.easeOut(duration: 0.14), value: hovering)
+    }
+
+    /// Reach for the live AppDelegate via its static `shared`
+    /// reference so the icon button can route into the same
+    /// primary-action map the hotkey system uses. Direct cast of
+    /// `NSApp.delegate` won't work here — SwiftUI's
+    /// `@NSApplicationDelegateAdaptor` wraps our delegate in a
+    /// `SwiftUI.AppDelegate` proxy, and the cast to our type silently
+    /// fails (see the doc comment on `AppDelegate.shared`).
+    private static var appDelegate: AppDelegate? { AppDelegate.shared }
+
     private func shortcutForModule(id: String) -> String? {
         let bindingId: String?
         switch id {
-        case "commandPalette":     bindingId = "commandPalette"
         case "colorPicker":        bindingId = "colorPicker"
         case "screenRuler":        bindingId = "screenRuler"
         case "textExtractor":      bindingId = "textExtractor"
         case "zoomIt":             bindingId = "zoomIt"
         case "fancyZones":         bindingId = "fancyZones"
-        case "windowManager":      bindingId = "alwaysOnTop"
+        case "windowManager":      bindingId = "pinWindow"
         case "meetingReminder":    bindingId = "joinMeeting"
         case "screenshotAnnotate": bindingId = "screenshot"
-        case "mouseHighlight":     bindingId = "mouseHighlight"
+        // Mouse Highlight is gesture-only (double-tap right ⌘) — no
+        // editable shortcut binding.
         default:                   bindingId = nil
         }
         guard let id = bindingId else { return nil }
@@ -1620,6 +1790,7 @@ private struct MenuBarTokenGrid: View {
             case .clock:
                 fmt.dateFormat = settings.menuBarTimeFormat
                 parts.append(fmt.string(from: now))
+            case .ongoingMeeting: parts.append("● Design Review · 23m left")
             case .nextEvent:    parts.append("Standup · 12m")
             case .countdown:    parts.append("12m")
             case .weekNumber:
@@ -2772,33 +2943,58 @@ private struct AboutFact: View {
 
 // MARK: - Shortcut Row (editable)
 
+/// Unified row used by Settings → Shortcuts. Handles both keystroke
+/// shortcuts (with an editable binding + Forge red record button) and
+/// gesture shortcuts (with a static monospaced label). Either way the
+/// row carries an enable / disable toggle on the left so the user can
+/// silence an individual action without messing with the binding.
 struct ShortcutRow: View {
-    let actionName: String
-    let actionId: String
+    let action: ShortcutBinding.Action
     @ObservedObject var settings: SettingsManager
     @State private var isRecording = false
     @State private var hoveringEdit = false
 
     private var binding: ShortcutBinding {
-        settings.binding(for: actionId)
+        settings.binding(for: action.id)
     }
 
     private var isDefault: Bool {
-        binding == ShortcutBinding.defaults[actionId]
+        binding == ShortcutBinding.defaults[action.id]
     }
 
     private var conflict: String? {
-        MacOSShortcutConflicts.description(keyCode: binding.keyCode,
-                                            modifiers: binding.nsModifiers)
+        guard !action.isGesture else { return nil }
+        return MacOSShortcutConflicts.description(
+            keyCode: binding.keyCode,
+            modifiers: binding.nsModifiers
+        )
+    }
+
+    private var isEnabled: Bool {
+        settings.isActionEnabled(action.id)
     }
 
     var body: some View {
-        HStack(spacing: 10) {
-            // Action label + conflict warning
-            VStack(alignment: .leading, spacing: 2) {
-                Text(actionName)
-                    .font(.system(size: 13, weight: .medium))
+        HStack(alignment: .center, spacing: 12) {
+            // Enable / disable toggle — silences an action without
+            // changing its binding. Disabled rows are visually dimmed.
+            Toggle("", isOn: Binding(
+                get: { isEnabled },
+                set: { settings.setActionEnabled(action.id, $0) }
+            ))
+            .toggleStyle(.forge)
+            .labelsHidden()
+
+            // Name + description + optional conflict warning
+            VStack(alignment: .leading, spacing: 3) {
+                Text(action.name)
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(ForgeTheme.Colors.textPrimary)
+                Text(action.description)
+                    .font(.system(size: 11))
+                    .foregroundColor(ForgeTheme.Colors.textSecondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
                 if let conflict = conflict {
                     HStack(spacing: 4) {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -2810,58 +3006,73 @@ struct ShortcutRow: View {
                 }
             }
 
-            Spacer()
+            Spacer(minLength: 12)
 
-            // Reset (only if non-default)
-            if !isDefault {
-                Button {
-                    settings.resetBinding(for: actionId)
-                } label: {
-                    Image(systemName: "arrow.counterclockwise")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.secondary)
-                        .frame(width: 22, height: 22)
-                        .background(Circle().fill(Color.black.opacity(0.04)))
-                }
-                .buttonStyle(.plain)
-                .help("Reset to default")
-            }
-
-            // The shortcut display itself (also recording target — click to record)
-            // Fixed width keeps every row aligned regardless of binding length
-            ShortcutRecorderView(
-                currentBinding: binding,
-                isRecording: $isRecording,
-                onRecord: { keyCode, modifiers in
-                    settings.updateBinding(for: actionId, keyCode: keyCode, modifiers: modifiers)
-                    isRecording = false
-                },
-                onCancel: { isRecording = false }
-            )
-            .frame(width: 160, height: 28)
-
-            // Edit (pencil) — explicit affordance to enter record mode
-            Button {
-                isRecording.toggle()
-            } label: {
-                Image(systemName: isRecording ? "xmark" : "pencil")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(isRecording ? .white : ForgeTheme.Colors.accent)
-                    .frame(width: 24, height: 24)
-                    .background(
-                        Circle().fill(
-                            isRecording
-                                ? ForgeTheme.Colors.accent
-                                : (hoveringEdit ? ForgeTheme.Colors.accent.opacity(0.18)
-                                                : ForgeTheme.Colors.accent.opacity(0.10))
-                        )
+            // Trailing column — either the gesture label chip OR the
+            // recorder + edit button.
+            if action.isGesture {
+                Text(action.gestureLabel ?? "")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundColor(ForgeTheme.Colors.textSecondary)
+                    .padding(.horizontal, 10).padding(.vertical, 4)
+                    .background(Capsule().fill(ForgeTheme.Colors.surfaceHover))
+                    .overlay(
+                        Capsule().strokeBorder(ForgeTheme.Colors.borderDefault, lineWidth: 0.5)
                     )
+            } else {
+                HStack(spacing: 8) {
+                    if !isDefault {
+                        Button {
+                            settings.resetBinding(for: action.id)
+                        } label: {
+                            Image(systemName: "arrow.counterclockwise")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(.secondary)
+                                .frame(width: 22, height: 22)
+                                .background(Circle().fill(Color.black.opacity(0.04)))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Reset to default")
+                    }
+                    ShortcutRecorderView(
+                        currentBinding: binding,
+                        isRecording: $isRecording,
+                        onRecord: { keyCode, modifiers in
+                            settings.updateBinding(for: action.id,
+                                                   keyCode: keyCode,
+                                                   modifiers: modifiers)
+                            isRecording = false
+                        },
+                        onCancel: { isRecording = false }
+                    )
+                    .frame(width: 140, height: 28)
+                    Button {
+                        isRecording.toggle()
+                    } label: {
+                        Image(systemName: isRecording ? "xmark" : "pencil")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(isRecording ? .white : ForgeTheme.Colors.accent)
+                            .frame(width: 24, height: 24)
+                            .background(
+                                Circle().fill(
+                                    isRecording
+                                        ? ForgeTheme.Colors.accent
+                                        : (hoveringEdit
+                                            ? ForgeTheme.Colors.accent.opacity(0.18)
+                                            : ForgeTheme.Colors.accent.opacity(0.10))
+                                )
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { hoveringEdit = $0 }
+                    .help(isRecording ? "Stop recording" : "Edit shortcut")
+                }
             }
-            .buttonStyle(.plain)
-            .onHover { hoveringEdit = $0 }
-            .help(isRecording ? "Stop recording" : "Edit shortcut")
         }
-        .padding(.vertical, 10)
+        .padding(.vertical, 12)
+        .padding(.horizontal, 4)
+        .opacity(isEnabled ? 1.0 : 0.55)
+        .animation(.easeOut(duration: 0.15), value: isEnabled)
     }
 }
 
@@ -2918,12 +3129,18 @@ enum MacOSShortcutConflicts {
 struct ShortcutRecorderView: NSViewRepresentable {
     let currentBinding: ShortcutBinding
     @Binding var isRecording: Bool
+    /// When true, single-key presses (no modifiers) are accepted — used
+    /// by the KeyRemap capture sheet where `a → b` is a valid mapping.
+    /// Defaults to false so the global Shortcuts tab still enforces a
+    /// modifier and bare letters can't capture system-wide hotkeys.
+    var allowsBareKey: Bool = false
     let onRecord: (UInt16, NSEvent.ModifierFlags) -> Void
     let onCancel: () -> Void
 
     func makeNSView(context: Context) -> ShortcutRecorderNSView {
         let view = ShortcutRecorderNSView()
         view.displayString = currentBinding.displayString
+        view.allowsBareKey = allowsBareKey
         view.onRecord = onRecord
         view.onCancel = onCancel
         return view
@@ -2931,6 +3148,7 @@ struct ShortcutRecorderView: NSViewRepresentable {
 
     func updateNSView(_ nsView: ShortcutRecorderNSView, context: Context) {
         nsView.displayString = currentBinding.displayString
+        nsView.allowsBareKey = allowsBareKey
         if isRecording && !nsView.isRecording {
             nsView.startRecording()
         } else if !isRecording && nsView.isRecording {
@@ -2943,6 +3161,9 @@ struct ShortcutRecorderView: NSViewRepresentable {
 final class ShortcutRecorderNSView: NSView {
     var displayString: String = "" { didSet { needsDisplay = true } }
     var isRecording: Bool = false { didSet { needsDisplay = true } }
+    /// See `ShortcutRecorderView.allowsBareKey`. Controls whether
+    /// modifier-less key presses are accepted in `startRecording`.
+    var allowsBareKey: Bool = false
     var onRecord: ((UInt16, NSEvent.ModifierFlags) -> Void)?
     var onCancel: (() -> Void)?
 
@@ -2978,9 +3199,11 @@ final class ShortcutRecorderNSView: NSView {
                 return nil
             }
 
-            // Need at least one modifier (prevent bare letters)
+            // Bare-letter gating — required for global hotkeys (otherwise
+            // pressing "a" while typing would capture a system shortcut)
+            // but disabled for KeyRemap, where `a → b` is the whole point.
             let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
-            guard !mods.isEmpty else { return nil }
+            if !self.allowsBareKey && mods.isEmpty { return nil }
 
             self.onRecord?(UInt16(event.keyCode), mods)
             self.stopRecording()

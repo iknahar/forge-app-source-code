@@ -3,7 +3,7 @@ import SwiftUI
 /// Every Forge utility conforms to this protocol.
 /// Disabled modules consume zero CPU/memory beyond this static registration record.
 protocol ForgeModule: AnyObject, Identifiable {
-    /// Unique identifier for the module (e.g., "calendar", "commandPalette")
+    /// Unique identifier for the module (e.g., "calendar", "screenshot")
     var id: String { get }
 
     /// Display name shown in Settings
@@ -31,9 +31,6 @@ protocol ForgeModule: AnyObject, Identifiable {
     @ViewBuilder
     func menuBarView() -> AnyView
 
-    /// Commands this module provides to the Command Palette
-    func commands() -> [ForgeCommand]
-
     /// Global keyboard shortcuts this module needs
     func shortcuts() -> [ForgeShortcut]
 }
@@ -45,55 +42,45 @@ extension ForgeModule {
         AnyView(EmptyView())
     }
 
-    func commands() -> [ForgeCommand] {
-        []
-    }
-
     func shortcuts() -> [ForgeShortcut] {
         []
     }
 }
 
 // MARK: - Module Category
+//
+// Order here = display order in the popover's Tools tab. Names mirror
+// the Settings → Shortcuts groups so the Tools list and the Shortcuts
+// list read as the same hierarchy.
 
 enum ModuleCategory: String, CaseIterable, Identifiable, Codable {
-    case calendar = "Calendar & Meetings"
-    case windows = "Window Management"
-    case files = "Files & Clipboard"
-    case screen = "Screen Tools"
-    case input = "Input Customization"
-    case system = "System Utilities"
-    case developer = "Developer Tools"
-    case launcher = "Launcher"
+    case calendar  = "Calendar & Meetings"
+    case windows   = "Window Management"
+    case screen    = "Screen Tools"
+    case input     = "Mouse & Highlights"
+    case keyboard  = "Keyboard"
+    case files     = "Files & Clipboard"
+    case developer = "Developer"
+    // Kept for back-compat with any persisted data that used these
+    // names — no modules live here anymore.
+    case system    = "System Utilities"
+    case launcher  = "Launcher"
 
     var id: String { rawValue }
 
     var iconName: String {
         switch self {
-        case .calendar: return "calendar"
-        case .windows: return "rectangle.split.3x1"
-        case .files: return "doc.on.clipboard"
-        case .screen: return "eyedropper"
-        case .input: return "keyboard"
-        case .system: return "gearshape.2"
+        case .calendar:  return "calendar"
+        case .windows:   return "rectangle.split.3x1"
+        case .screen:    return "eyedropper"
+        case .input:     return "cursorarrow.click.2"
+        case .keyboard:  return "keyboard"
+        case .files:     return "doc.on.clipboard"
         case .developer: return "terminal"
-        case .launcher: return "magnifyingglass"
+        case .system:    return "gearshape.2"
+        case .launcher:  return "magnifyingglass"
         }
     }
-}
-
-// MARK: - Command (for Command Palette)
-
-struct ForgeCommand: Identifiable {
-    let id: String
-    let title: String
-    let subtitle: String?
-    let iconName: String
-    let moduleId: String
-    let action: () -> Void
-
-    /// Keywords for fuzzy search matching
-    let keywords: [String]
 }
 
 // MARK: - Shortcut Definition

@@ -34,23 +34,53 @@ final class MeetingReminderModule: ForgeModule, ObservableObject {
     @Published private(set) var activeEvent: CalendarEvent?
     private var pollTimer: Timer?
     private var window: NSPanel?
+    /// Event IDs the user has already dismissed (banner closed via X,
+    /// dismiss button, or by joining the meeting). Persisted across
+    /// app restarts so a dismissed reminder doesn't pop up again next
+    /// launch — the user said "no" once, that's a real preference.
     private var dismissed: Set<String> = []
+    /// Per-event "shut up until this time" — the snooze flow stamps
+    /// a future date here, the filter in `tick()` honors it. Also
+    /// persisted so a 10-minute snooze survives a quick app restart.
     private var snoozedUntil: [String: Date] = [:]
 
     // MARK: - Lifecycle
 
     func activate() {
+        loadPersistedState()
+        // Listen for Join clicks from anywhere in the app (calendar
+        // popover, full-calendar view, event detail card, etc.) so a
+        // single Join action also kills any pending reminder for the
+        // same event — the user already engaged, no point pinging
+        // them about it again.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleMeetingJoinedNotification(_:)),
+            name: .meetingJoined,
+            object: nil
+        )
         startPolling()
         print("[Forge MeetingReminder] Activated")
     }
 
     func deactivate() {
+        NotificationCenter.default.removeObserver(self, name: .meetingJoined, object: nil)
         stopPolling()
         hideBanner()
         print("[Forge MeetingReminder] Deactivated")
     }
 
-    func commands() -> [ForgeCommand] { [] }
+    /// Mark the event whose Join button was just pressed as dismissed,
+    /// AND hide the active banner / full-screen alert if it happens to
+    /// be showing this same event. Idempotent — re-firing the
+    /// notification (e.g. user clicked Join twice) is harmless.
+    @objc private func handleMeetingJoinedNotification(_ note: Notification) {
+        guard let eventId = note.userInfo?["eventId"] as? String else { return }
+        markDismissed(eventId)
+        if activeEvent?.id == eventId {
+            hideBanner()
+        }
+    }
 
     // MARK: - Polling
 
@@ -78,7 +108,9 @@ final class MeetingReminderModule: ForgeModule, ObservableObject {
         let leadSeconds = TimeInterval(max(0, settings.meetingReminderMinutes) * 60)
         let maxStartedAgoSeconds: TimeInterval = 10 * 60
 
-        let candidate = cal.events
+        // Reads from `activeEvents` (already strips declined RSVPs) so
+        // declining a meeting also kills its reminder banner.
+        let candidate = cal.activeEvents
             .filter { event in
                 let toStart = event.startDate.timeIntervalSince(now)
                 let upcoming = toStart > 0 && toStart <= leadSeconds
@@ -91,6 +123,11 @@ final class MeetingReminderModule: ForgeModule, ObservableObject {
             .filter { (snoozedUntil[$0.id] ?? .distantPast) <= now }
             .sorted { $0.startDate < $1.startDate }
             .first
+
+        // Opportunistic GC: drop dismissed/snoozed entries for events
+        // that have already ended so the persisted state doesn't grow
+        // forever.
+        gcExpired()
 
         print("[Forge MeetingReminder] tick events=\(cal.events.count) lead=\(Int(leadSeconds))s style=\(settings.meetingReminderStyle.rawValue) candidate=\(candidate?.title ?? "none")")
 
@@ -249,20 +286,21 @@ final class MeetingReminderModule: ForgeModule, ObservableObject {
     // MARK: - Actions
 
     private func handleJoin(_ event: CalendarEvent) {
-        if let url = event.meetingURL {
-            NSWorkspace.shared.open(url)
-        }
-        dismissed.insert(event.id)
-        hideBanner()
+        // `MeetingLauncher.join` opens the native client AND posts
+        // `.meetingJoined`, which our own observer
+        // (`handleMeetingJoinedNotification`) picks up — that handler
+        // does both `markDismissed` and `hideBanner`. So this one
+        // call covers the full join-side-effects pipeline.
+        MeetingLauncher.join(event)
     }
 
     private func handleSnooze(_ event: CalendarEvent, minutes: Int) {
-        snoozedUntil[event.id] = Date().addingTimeInterval(TimeInterval(minutes * 60))
+        markSnoozed(event.id, minutes: minutes)
         hideBanner()
     }
 
     private func handleDismiss(_ event: CalendarEvent) {
-        dismissed.insert(event.id)
+        markDismissed(event.id)
         hideBanner()
     }
 
@@ -291,6 +329,83 @@ final class MeetingReminderModule: ForgeModule, ObservableObject {
             } catch {
                 print("[Forge MeetingReminder] RSVP failed: \(error.localizedDescription)")
             }
+        }
+    }
+
+    // MARK: - Persistence
+
+    /// JSON shape on disk. Only two pieces of state — the dismissed
+    /// event-id set and the snooze-until map — so this stays small.
+    private struct ReminderState: Codable {
+        var dismissedEventIds: [String]
+        var snoozedUntil: [String: Date]
+    }
+
+    private var stateURL: URL {
+        let dir = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Forge", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("meeting_reminder_state.json")
+    }
+
+    /// Load dismissed/snoozed state from disk on activation so a
+    /// reminder the user dismissed before quitting Forge stays
+    /// dismissed when they launch it again.
+    private func loadPersistedState() {
+        guard
+            let data = try? Data(contentsOf: stateURL),
+            let state = try? JSONDecoder().decode(ReminderState.self, from: data)
+        else { return }
+        dismissed = Set(state.dismissedEventIds)
+        snoozedUntil = state.snoozedUntil
+    }
+
+    private func persistState() {
+        let state = ReminderState(
+            dismissedEventIds: Array(dismissed),
+            snoozedUntil: snoozedUntil
+        )
+        guard let data = try? JSONEncoder().encode(state) else { return }
+        try? data.write(to: stateURL, options: .atomic)
+    }
+
+    /// Mark an event dismissed AND persist. Use this everywhere we
+    /// touch the `dismissed` set so the on-disk record stays in sync.
+    private func markDismissed(_ eventId: String) {
+        dismissed.insert(eventId)
+        persistState()
+    }
+
+    /// Set a snooze deadline AND persist.
+    private func markSnoozed(_ eventId: String, minutes: Int) {
+        snoozedUntil[eventId] = Date().addingTimeInterval(TimeInterval(minutes * 60))
+        persistState()
+    }
+
+    /// Prune dismissed/snoozed entries for events that have already
+    /// ended — keeps the persisted state from growing without bound
+    /// over months of usage. Entries for events we don't currently
+    /// know about (deleted, or events list not loaded yet) are kept
+    /// conservatively so a transient calendar fetch doesn't lose
+    /// the user's intent.
+    private func gcExpired() {
+        guard let cal = calendarRef else { return }
+        let now = Date()
+        let byId = Dictionary(uniqueKeysWithValues: cal.events.map { ($0.id, $0) })
+        let beforeCount = dismissed.count + snoozedUntil.count
+
+        dismissed = dismissed.filter { id in
+            guard let event = byId[id] else { return true }
+            return event.endDate > now
+        }
+        snoozedUntil = snoozedUntil.filter { id, _ in
+            guard let event = byId[id] else { return true }
+            return event.endDate > now
+        }
+
+        if beforeCount != dismissed.count + snoozedUntil.count {
+            persistState()
         }
     }
 }
@@ -871,7 +986,7 @@ struct FullScreenMeetingAlert: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 80)
 
-                // Meta row (calendar + time range)
+                // Meta row (calendar + time range + attendee count)
                 HStack(spacing: 18) {
                     metaItem(icon: "calendar", text: event.calendarTitle)
                     Divider().frame(height: 14).background(Color.white.opacity(0.15))
@@ -883,7 +998,31 @@ struct FullScreenMeetingAlert: View {
                 }
                 .foregroundColor(.white.opacity(0.65))
 
-                Spacer().frame(height: 24)
+                // Attendee avatar strip — up to 8 chips with overflow.
+                // Hovering an avatar surfaces name + email + RSVP.
+                if !event.attendees.isEmpty {
+                    AttendeeAvatarStrip(
+                        attendees: event.attendees,
+                        maxShown: 8,
+                        avatarSize: 36,
+                        darkMode: true
+                    )
+                    .padding(.top, 4)
+                }
+
+                Spacer().frame(height: 18)
+
+                // RSVP row — visible only for Google events the user
+                // is invited to.
+                if event.isGoogleEvent, event.isInvited {
+                    VStack(spacing: 6) {
+                        Text("YOUR RESPONSE")
+                            .font(.system(size: 9, weight: .semibold))
+                            .tracking(1.2)
+                            .foregroundColor(.white.opacity(0.45))
+                        RSVPButtonRow(event: event, darkMode: true)
+                    }
+                }
 
                 // Attachments — always expanded in the full-screen alert
                 // (the floating banner shows them collapsed behind a

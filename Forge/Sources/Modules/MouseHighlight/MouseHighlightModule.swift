@@ -2,8 +2,9 @@ import SwiftUI
 import AppKit
 
 /// Mouse Highlight — visual enhancements for the mouse cursor.
-/// Features: Find My Mouse (double-press Ctrl for spotlight),
-/// Click Highlighter (colored circles on clicks), and Crosshairs.
+/// Features: Find My Mouse (double-tap RIGHT Command for spotlight),
+/// Click Highlighter (small yellow ring on every click — toggled via
+/// global hotkey), and Crosshairs.
 final class MouseHighlightModule: ForgeModule, ObservableObject {
     let id = "mouseHighlight"
     let name = "Mouse Highlight"
@@ -15,15 +16,32 @@ final class MouseHighlightModule: ForgeModule, ObservableObject {
     // MARK: - State
 
     @Published var findMyMouseEnabled: Bool = true
-    @Published var clickHighlightEnabled: Bool = true
+    /// Bridges the per-action enable toggle from SettingsManager into
+    /// the module so the gesture handler can be silenced without
+    /// removing the monitor. Set by AppDelegate on init + on every
+    /// Settings change.
+    var isFindMyMouseGestureEnabled: () -> Bool = { true }
+    var isClickHighlighterShortcutEnabled: () -> Bool = { true }
+    /// Click Highlighter is OFF by default — the user toggles it on
+    /// via the global ⌘⌥H shortcut (or the Modules tab). It's a
+    /// "presentation mode" feature, not something you want firing
+    /// during normal use.
+    @Published var clickHighlightEnabled: Bool = false
     @Published var crosshairsEnabled: Bool = false
-    @Published var spotlightRadius: CGFloat = 120
+    /// Find-My-Mouse spotlight halo radius. Tuned tighter (was 120pt)
+    /// so the ring reads as a friendly "here's your cursor" pulse
+    /// rather than a heavy dim across half the screen.
+    @Published var spotlightRadius: CGFloat = 88
     @Published var clickRingColor: NSColor = .systemYellow
-    @Published var clickRingSize: CGFloat = 30
+    /// Radius of the click-highlight disc. Bumped from 22pt → 28pt
+    /// (44pt → 56pt diameter) so the ring is clearly visible on
+    /// large external displays during presentations / screen
+    /// recordings without obscuring the click target.
+    @Published var clickRingSize: CGFloat = 28
     @Published var isFindMyMouseActive: Bool = false
 
     // Event monitors
-    private var ctrlPressMonitor: Any?
+    private var rightCmdMonitor: Any?
     private var clickMonitor: Any?
     private var moveMonitor: Any?
     /// Local-app counterpart of `moveMonitor`. Global event monitors only
@@ -31,13 +49,19 @@ final class MouseHighlightModule: ForgeModule, ObservableObject {
     /// when the cursor is over a Forge window the spotlight wouldn't follow
     /// it. The local monitor catches those.
     private var moveLocalMonitor: Any?
-    private var lastCtrlPressTime: TimeInterval = 0
+    private var lastRightCmdPressTime: TimeInterval = 0
     private let doublePressTreshold: TimeInterval = 0.4
-    /// Previous flagsChanged state so we can detect a true Ctrl press
-    /// transition (key going from up to down) rather than reacting to any
-    /// flag-change event that happens to have Ctrl set in its modifier
-    /// mask (e.g. when ⌥ is added on top of ⌃ during the ⌃⌥S shortcut).
-    private var wasCtrlDown: Bool = false
+    /// Previous flagsChanged state so we can detect a true RIGHT Command
+    /// press transition (key going from up to down) rather than reacting
+    /// to every flag-change that happens to include .command in its
+    /// modifier mask.
+    private var wasRightCmdDown: Bool = false
+    /// kVK_RightCommand — the right ⌘ key on full-size + most laptop
+    /// keyboards. Distinct from kVK_Command (54 → 55? See note). On macOS
+    /// keyCode 54 is right ⌘, 55 is left ⌘. We trigger on right-only
+    /// so the user can still use left-⌘ for other shortcuts without
+    /// any double-tap interference.
+    private let rightCommandKeyCode: UInt16 = 54
 
     // Windows
     private var spotlightWindow: NSWindow?
@@ -59,12 +83,25 @@ final class MouseHighlightModule: ForgeModule, ObservableObject {
     func toggleFindMyMouse() {
         if isFindMyMouseActive { hideSpotlight() } else { showSpotlight() }
     }
+
+    /// Public entrypoint for the ⌘⌥H "Turn on click highlighter"
+    /// shortcut. Flips `clickHighlightEnabled` so every subsequent
+    /// mouse click paints the small yellow ring at the click point.
+    /// Pressing the shortcut again turns it back off.
+    func toggleClickHighlighter() {
+        clickHighlightEnabled.toggle()
+        // Brief tactile feedback so the user knows which state they're in.
+        NSSound(named: NSSound.Name(clickHighlightEnabled ? "Pop" : "Tink"))?.play()
+        // Clear any in-flight rings on disable so we don't leave a
+        // stray fade-out on screen.
+        if !clickHighlightEnabled { clearClickRings() }
+    }
     private var clickWindows: [NSWindow] = []
 
     // MARK: - Lifecycle
 
     func activate() {
-        setupCtrlMonitor()
+        setupRightCommandMonitor()
         setupClickMonitor()
         if crosshairsEnabled { showCrosshairs() }
 
@@ -88,10 +125,10 @@ final class MouseHighlightModule: ForgeModule, ObservableObject {
             queue: .main
         ) { [weak self] _ in
             self?.screenshotInProgress = false
-            // Clear any stale Ctrl-press timestamp so the very next press
+            // Clear any stale press timestamp so the very next press
             // after the screenshot doesn't immediately count as a double.
-            self?.lastCtrlPressTime = 0
-            self?.wasCtrlDown = false
+            self?.lastRightCmdPressTime = 0
+            self?.wasRightCmdDown = false
         }
     }
 
@@ -110,36 +147,37 @@ final class MouseHighlightModule: ForgeModule, ObservableObject {
         }
     }
 
-    // MARK: - Find My Mouse (Double-press Ctrl)
+    // MARK: - Find My Mouse (Double-tap RIGHT Command)
 
-    private func setupCtrlMonitor() {
-        ctrlPressMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+    private func setupRightCommandMonitor() {
+        rightCmdMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
             guard let self = self,
                   self.findMyMouseEnabled,
+                  self.isFindMyMouseGestureEnabled(),
                   !self.screenshotInProgress
             else { return }
 
+            // Only care about the right-Command physical key. flagsChanged
+            // fires once per modifier-key state change; keyCode identifies
+            // which physical key caused it.
+            guard event.keyCode == self.rightCommandKeyCode else { return }
+
             let flags = event.modifierFlags
-            let ctrlNow = flags.contains(.control)
-            // Any other modifier on the line ⇒ this isn't a clean "tap Ctrl
-            // by itself" — it's part of a combo like ⌃⌥S (the screenshot
-            // shortcut). Don't count it as a Find My Mouse press.
-            let otherMods: NSEvent.ModifierFlags = [.option, .command, .shift, .function]
+            // Any other modifier on the line ⇒ this isn't a clean "tap
+            // right-⌘ by itself" — could be part of a combo. Ignore.
+            let otherMods: NSEvent.ModifierFlags = [.control, .option, .shift, .function]
             let hasOtherMods = !flags.intersection(otherMods).isEmpty
 
-            // Remember the new Ctrl state for the next event before any
-            // early return so the transition detection stays correct.
-            let wasDown = self.wasCtrlDown
-            self.wasCtrlDown = ctrlNow
+            let cmdNow = flags.contains(.command)
+            let wasDown = self.wasRightCmdDown
+            self.wasRightCmdDown = cmdNow
 
-            // Only react on the actual press transition (up → down) of a
-            // bare Ctrl key — no other modifiers involved.
-            guard ctrlNow, !wasDown, !hasOtherMods else { return }
+            // Only react on the press transition (up → down) of a bare
+            // right-⌘.
+            guard cmdNow, !wasDown, !hasOtherMods else { return }
 
             let now = ProcessInfo.processInfo.systemUptime
-
-            if now - self.lastCtrlPressTime < self.doublePressTreshold {
-                // Double-press detected
+            if now - self.lastRightCmdPressTime < self.doublePressTreshold {
                 DispatchQueue.main.async {
                     if self.isFindMyMouseActive {
                         self.hideSpotlight()
@@ -147,9 +185,9 @@ final class MouseHighlightModule: ForgeModule, ObservableObject {
                         self.showSpotlight()
                     }
                 }
-                self.lastCtrlPressTime = 0 // Reset to prevent triple-trigger
+                self.lastRightCmdPressTime = 0 // prevent triple-trigger
             } else {
-                self.lastCtrlPressTime = now
+                self.lastRightCmdPressTime = now
             }
         }
     }
@@ -282,12 +320,15 @@ final class MouseHighlightModule: ForgeModule, ObservableObject {
     }
 
     private func showClickRing(at screenPoint: NSPoint, isRightClick: Bool) {
-        let ringSize = clickRingSize * 2
+        // Window is sized slightly larger than the disc so the soft
+        // fill's edge doesn't get clipped against the window bounds.
+        let pad: CGFloat = 4
+        let windowSize = clickRingSize * 2 + pad * 2
         let ringFrame = NSRect(
-            x: screenPoint.x - ringSize / 2,
-            y: screenPoint.y - ringSize / 2,
-            width: ringSize,
-            height: ringSize
+            x: screenPoint.x - windowSize / 2,
+            y: screenPoint.y - windowSize / 2,
+            width: windowSize,
+            height: windowSize
         )
 
         let window = OverlayWindow(
@@ -311,13 +352,16 @@ final class MouseHighlightModule: ForgeModule, ObservableObject {
 
         clickWindows.append(window)
 
-        // Animate ring expanding and fading
         animateClickRing(view: ringView, window: window)
     }
 
     private func animateClickRing(view: ClickRingView, window: NSWindow) {
         var progress: CGFloat = 0
-        let duration: TimeInterval = 0.4
+        // 1s total — the disc snaps in, holds at full opacity for the
+        // bulk of the second, then fades out. Matches the alpha curve
+        // in `ClickRingView.draw(_:)` (5% fade-in / 80% hold / 15%
+        // fade-out → ≈ 50ms / 800ms / 150ms at this duration).
+        let duration: TimeInterval = 1.0
         let startTime = CACurrentMediaTime()
 
         let displayLink = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self, weak view, weak window] timer in
@@ -402,9 +446,9 @@ final class MouseHighlightModule: ForgeModule, ObservableObject {
     // MARK: - Cleanup
 
     private func removeAllMonitors() {
-        if let monitor = ctrlPressMonitor {
+        if let monitor = rightCmdMonitor {
             NSEvent.removeMonitor(monitor)
-            ctrlPressMonitor = nil
+            rightCmdMonitor = nil
         }
         if let monitor = clickMonitor {
             NSEvent.removeMonitor(monitor)
@@ -418,37 +462,6 @@ final class MouseHighlightModule: ForgeModule, ObservableObject {
 
     // MARK: - Commands
 
-    func commands() -> [ForgeCommand] {
-        [
-            ForgeCommand(
-                id: "mouse.findmymouse", title: "Find My Mouse", subtitle: "Spotlight effect on cursor",
-                iconName: "cursorarrow.rays", moduleId: id,
-                action: { [weak self] in self?.showSpotlight() },
-                keywords: ["find", "mouse", "cursor", "spotlight", "highlight", "locate"]
-            ),
-            ForgeCommand(
-                id: "mouse.crosshairs", title: "Toggle Crosshairs", subtitle: "Show fullscreen crosshairs at cursor",
-                iconName: "plus.circle", moduleId: id,
-                action: { [weak self] in
-                    guard let self = self else { return }
-                    if self.crosshairsEnabled {
-                        self.hideCrosshairs()
-                    } else {
-                        self.showCrosshairs()
-                    }
-                },
-                keywords: ["crosshair", "cursor", "guide", "lines", "mouse"]
-            ),
-            ForgeCommand(
-                id: "mouse.clickhighlight", title: "Toggle Click Highlight", subtitle: "Show colored rings on mouse clicks",
-                iconName: "cursorarrow.click", moduleId: id,
-                action: { [weak self] in
-                    self?.clickHighlightEnabled.toggle()
-                },
-                keywords: ["click", "highlight", "ring", "mouse", "visual"]
-            ),
-        ]
-    }
 }
 
 // MARK: - Spotlight View (Find My Mouse)
@@ -541,53 +554,55 @@ final class SpotlightView: NSView {
 
 // MARK: - Click Ring View
 
+/// Small, soft yellow click highlight. Renders a constant-size disc
+/// (no expansion) with a fade-in / hold / fade-out alpha curve. Matches
+/// the user-requested "very small yellow shade only when clicking".
 final class ClickRingView: NSView {
     var ringColor: NSColor = .systemYellow
-    var maxRadius: CGFloat = 30
-    var progress: CGFloat = 0 // 0 to 1
+    var maxRadius: CGFloat = 10
+    var progress: CGFloat = 0 // 0 to 1 across the full animation
 
     override func draw(_ dirtyRect: NSRect) {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
         context.clear(bounds)
 
         let center = NSPoint(x: bounds.midX, y: bounds.midY)
-        let currentRadius = maxRadius * (0.3 + progress * 0.7) // Start at 30%, expand to 100%
-        let alpha = 1.0 - progress // Fade out
 
-        // Outer ring
-        context.saveGState()
-        context.setStrokeColor(ringColor.withAlphaComponent(alpha * 0.8).cgColor)
-        context.setLineWidth(2.5)
-        context.strokeEllipse(in: NSRect(
-            x: center.x - currentRadius,
-            y: center.y - currentRadius,
-            width: currentRadius * 2,
-            height: currentRadius * 2
-        ))
-
-        // Inner fill
-        context.setFillColor(ringColor.withAlphaComponent(alpha * 0.15).cgColor)
-        context.fillEllipse(in: NSRect(
-            x: center.x - currentRadius,
-            y: center.y - currentRadius,
-            width: currentRadius * 2,
-            height: currentRadius * 2
-        ))
-
-        // Center dot (visible at start, fades quickly)
-        let dotAlpha = max(0, 1.0 - progress * 3)
-        if dotAlpha > 0 {
-            context.setFillColor(ringColor.withAlphaComponent(dotAlpha).cgColor)
-            let dotSize: CGFloat = 4
-            context.fillEllipse(in: NSRect(
-                x: center.x - dotSize / 2,
-                y: center.y - dotSize / 2,
-                width: dotSize,
-                height: dotSize
-            ))
+        // Alpha curve, expressed as percentages of the total
+        // animation duration (1s). Tuned so the disc reads as
+        // genuinely visible for the bulk of that second:
+        //   0.00 .. 0.05  → fade in   (≈ 50 ms)
+        //   0.05 .. 0.85  → hold at full (≈ 800 ms)
+        //   0.85 .. 1.00  → fade out  (≈ 150 ms)
+        let alpha: CGFloat
+        if progress < 0.05 {
+            alpha = progress / 0.05
+        } else if progress < 0.85 {
+            alpha = 1.0
+        } else {
+            alpha = max(0, 1.0 - (progress - 0.85) / 0.15)
         }
 
-        context.restoreGState()
+        // Soft yellow disc (filled, ~50% alpha at peak so it reads as
+        // a "shade", not a solid blob).
+        context.setFillColor(ringColor.withAlphaComponent(alpha * 0.55).cgColor)
+        context.fillEllipse(in: NSRect(
+            x: center.x - maxRadius,
+            y: center.y - maxRadius,
+            width: maxRadius * 2,
+            height: maxRadius * 2
+        ))
+
+        // Crisp outline so the disc reads against any background
+        // (white desktops, photos, etc.).
+        context.setStrokeColor(ringColor.withAlphaComponent(alpha * 0.95).cgColor)
+        context.setLineWidth(1.25)
+        context.strokeEllipse(in: NSRect(
+            x: center.x - maxRadius + 0.625,
+            y: center.y - maxRadius + 0.625,
+            width: maxRadius * 2 - 1.25,
+            height: maxRadius * 2 - 1.25
+        ))
     }
 }
 

@@ -38,21 +38,22 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
     private var overlayView: LightshotOverlayView?
     private var sessionRef: AnnotationSession?
 
+    /// Translator overlay state — non-nil while the magic translation
+    /// panel is on screen on top of the selection rect.
+    private var translatorPanel: NSPanel?
+    private var translatorModel: TranslationOverlayModel?
+    /// Cropped, retina-resolution CGImage of the user's selection.
+    /// Held so re-translate (after a language change) doesn't have to
+    /// re-crop from the full-screen capture.
+    private var translatorImage: CGImage?
+
+    /// Reference to the global settings — needed by the on-screen
+    /// translator to read source / target language preferences.
+    weak var settingsRef: SettingsManager?
+
     func activate() {}
     func deactivate() {
         dismissLightshot()
-    }
-
-    func commands() -> [ForgeCommand] {
-        [ForgeCommand(
-            id: "screenshot.capture",
-            title: "Screenshot — capture & annotate",
-            subtitle: "Drag to select a region",
-            iconName: "camera.viewfinder",
-            moduleId: id,
-            action: { [weak self] in self?.startCapture() },
-            keywords: ["screenshot", "snap", "capture", "annotate", "draw"]
-        )]
     }
 
     // MARK: - Capture (Lightshot-style: selection stays in place)
@@ -190,9 +191,16 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
 
         let toolbar = LightshotToolbar(
             session: session,
+            settings: settingsRef,
             onCopy:    { [weak self] in self?.copyToClipboard() },
             onSave:    { [weak self] in self?.saveToFile() },
             onUpload:  { [weak self] in self?.uploadAndShare() },
+            onTranslate: { [weak self] in
+                // Magic overlay flow — opens a panel positioned over
+                // the selection rect, runs OCR + translation, lets the
+                // user re-translate live by changing language pickers.
+                self?.startTranslationOverlay()
+            },
             onClose:   { [weak self] in self?.dismissLightshot() }
         )
         let hosting = NSHostingController(rootView: toolbar)
@@ -245,6 +253,7 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
         NSCursor.pop()
         regionWindow?.orderOut(nil);   regionWindow = nil
         toolbarWindow?.orderOut(nil);  toolbarWindow = nil
+        dismissTranslationOverlay()
         overlayView = nil
         sessionRef = nil
         fullScreenImage = nil
@@ -344,14 +353,250 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
     }
 
     private func saveToFile() {
+        // If the translation overlay is up, dismiss it first. The
+        // saved PNG is rendered from the underlying selection
+        // (NOT the translated overlay), so keeping the translation
+        // panel visible while the save sheet appears would be
+        // misleading — the user would think they're saving the
+        // translated view but the file would contain the original.
+        // Exiting the translation immediately makes the source of
+        // truth obvious.
+        dismissTranslationOverlay()
+
         guard let data = renderAnnotatedSelectionPNG() else { return }
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.png]
         panel.nameFieldStringValue = "Forge-Screenshot.png"
-        if panel.runModal() == .OK, let url = panel.url {
-            try? data.write(to: url)
+
+        // Attach the save dialog as a SHEET to the screenshot
+        // window rather than running it as a free-floating modal.
+        // Two reasons:
+        //   1. The screenshot overlay is at `.screenSaver` window
+        //      level; an NSSavePanel opened with `runModal()`
+        //      lives at normal level, which means it renders
+        //      *behind* the overlay — the dialog was effectively
+        //      invisible to the user.
+        //   2. `runModal()` blocks the main thread. While it spins
+        //      its run-loop the screenshot toolbar's X / Esc paths
+        //      can't fire — that's why "X cross is not exiting"
+        //      and "esc doesn't dismiss" in the bug report.
+        // A sheet anchored to `regionWindow` is rendered above it
+        // (inheriting its level), and the completion handler runs
+        // async so the rest of the screenshot session stays
+        // interactive while the sheet is up.
+        if let parent = regionWindow {
+            // Hide the toolbar window before presenting the sheet.
+            // Sheets inherit their parent window's level — the
+            // region window is at `.statusBar` (25), but the
+            // toolbar floats at `.popUpMenu` (101), one rung above
+            // it. Without this `orderOut`, the toolbar would sit
+            // ON TOP of the save sheet (which is exactly what the
+            // user reported: "still under action bar").
+            //
+            // We don't need to restore the toolbar on completion —
+            // both OK and Cancel branches call `dismissLightshot`,
+            // which tears down the whole screenshot session.
+            toolbarWindow?.orderOut(nil)
+            panel.beginSheetModal(for: parent) { [weak self] response in
+                if response == .OK, let url = panel.url {
+                    try? data.write(to: url)
+                }
+                self?.dismissLightshot()
+            }
+        } else {
+            // Fallback: standalone path with elevated level so it
+            // still appears above any high-level windows. Shouldn't
+            // normally happen because `saveToFile` is only invoked
+            // while the screenshot session is on screen, but
+            // defensive belt-and-suspenders.
+            panel.level = .screenSaver + 1
+            if panel.runModal() == .OK, let url = panel.url {
+                try? data.write(to: url)
+            }
+            dismissLightshot()
         }
-        dismissLightshot()
+    }
+
+    /// Entry point from the toolbar's translate button. Sets up the
+    /// magic overlay panel sized to the selection rect, then kicks off
+    /// the first translation pass. Re-translates live whenever the
+    /// model's source or target language changes.
+    fileprivate func startTranslationOverlay() {
+        guard
+            let view = overlayView,
+            let cgFull = fullScreenImage,
+            let screen = NSScreen.main,
+            let settings = settingsRef
+        else { return }
+
+        let rect = view.selection
+        guard rect.width >= 4, rect.height >= 4 else { return }
+
+        // Crop the selection at retina resolution (clean pixels — no
+        // annotations baked in).
+        let scale = screen.backingScaleFactor
+        let cgRect = CGRect(
+            x: rect.minX * scale,
+            y: (screen.frame.height - rect.maxY) * scale,
+            width: rect.width * scale,
+            height: rect.height * scale
+        )
+        guard let cropped = cgFull.cropping(to: cgRect) else { return }
+        translatorImage = cropped
+
+        // Build the observable model — language defaults come from
+        // settings (so "last-selected" persistence lives there).
+        //
+        // The translator's × dismisses ONLY the translator overlay —
+        // the screenshot tool (toolbar, selection, dim) stays alive
+        // so the user can move/resize/annotate, drag a new region,
+        // or re-translate after tweaking. Full-session dismiss is
+        // still available via Esc or the × on the screenshot toolbar.
+        let model = TranslationOverlayModel(
+            sourceLanguage: settings.translateSourceLanguage,
+            targetLanguage: settings.translateTargetLanguage,
+            onDismiss: { [weak self] in self?.dismissTranslationOverlay() },
+            onLanguageChange: { [weak self] source, target in
+                self?.handleLanguageChange(source: source, target: target)
+            }
+        )
+        translatorModel = model
+
+        // Compose the panel frame: the selection rect itself PLUS a
+        // controls strip ABOVE it (or below if there's not enough room
+        // above the selection on the current screen). The SwiftUI view
+        // knows both rects via the model and renders accordingly.
+        let stripHeight: CGFloat = 34
+        let stripGap: CGFloat = 6
+        let panelMinWidth: CGFloat = 320          // ensure controls fit even on narrow selections
+        let panelWidth = max(rect.width, panelMinWidth)
+        let panelHeight = rect.height + stripHeight + stripGap
+
+        // Try ABOVE the selection first. If that would push the strip
+        // off the top of the screen, flip BELOW.
+        let preferAbove = rect.maxY + stripHeight + stripGap <= screen.frame.maxY
+        // x — left-align with the selection but clamp to the screen.
+        var panelX = rect.minX
+        if panelX + panelWidth > screen.frame.maxX {
+            panelX = screen.frame.maxX - panelWidth
+        }
+        panelX = max(panelX, screen.frame.minX)
+        let panelY: CGFloat
+        let stripIsBelow: Bool
+        if preferAbove {
+            // Panel covers [selection.minY ... selection.maxY + strip]
+            panelY = rect.minY
+            stripIsBelow = false
+        } else {
+            // Panel covers [selection.minY - strip ... selection.maxY]
+            panelY = rect.minY - (stripHeight + stripGap)
+            stripIsBelow = true
+        }
+        let panelFrame = NSRect(x: panelX, y: panelY, width: panelWidth, height: panelHeight)
+
+        // The SwiftUI view needs to know where to place its strip and
+        // where to draw the per-block overlay (the selection rect in
+        // panel-local coords). NSPanel uses bottom-left origin but the
+        // SwiftUI content inside is top-left — so when the strip
+        // floats ABOVE the selection on screen (stripIsBelow == false),
+        // the strip occupies the TOP of the panel in SwiftUI coords
+        // and the selection sits below it. Flipping these used to
+        // place the overlay where the strip should have been (text
+        // appeared above the real selection) and pushed the controls
+        // off the top of the panel.
+        let panelSize = panelFrame.size
+        let selectionInPanel = NSRect(
+            x: rect.minX - panelFrame.minX,
+            y: stripIsBelow ? 0 : (stripHeight + stripGap),
+            width: rect.width,
+            height: rect.height
+        )
+        model.layoutMetrics = .init(
+            panelSize: panelSize,
+            selectionInPanel: selectionInPanel,
+            stripHeight: stripHeight,
+            stripIsBelow: stripIsBelow
+        )
+
+        // Host the SwiftUI overlay in a non-activating NSPanel.
+        let host = NSHostingController(rootView: TranslationOverlayPanel(model: model))
+        let panel = TranslationOverlayPanelWindow(
+            contentRect: panelFrame,
+            styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        panel.contentViewController = host
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.level = .popUpMenu             // above LightshotOverlayView (.statusBar)
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.setFrame(panelFrame, display: true)
+        panel.orderFrontRegardless()
+        translatorPanel = panel
+
+        // Kick off the first translation pass.
+        model.isTranslating = true
+        runTranslation(model: model)
+    }
+
+    /// Re-run the translation pipeline against the cached selection
+    /// image with whatever source / target the model currently has.
+    private func runTranslation(model: TranslationOverlayModel) {
+        guard let image = translatorImage else { return }
+        let source = model.sourceLanguage
+        let target = model.targetLanguage
+        model.isTranslating = true
+        Task { [weak self, weak model] in
+            do {
+                let result = try await ScreenTranslator.translate(
+                    image: image,
+                    sourceLanguage: source,
+                    targetLanguage: target
+                )
+                await MainActor.run {
+                    guard let model = model else { return }
+                    // Auto-detect mismatch: if the user kept "auto" and
+                    // we got a detected code, leave sourceLanguage as
+                    // "auto" — the view shows the detected label.
+                    // If the user set an EXPLICIT source that doesn't
+                    // match the detected one, override their setting
+                    // to the detected code (per user spec).
+                    if source != "auto",
+                       let detected = result.detectedLanguage,
+                       detected != source {
+                        model.sourceLanguage = detected
+                        self?.settingsRef?.translateSourceLanguage = detected
+                    }
+                    model.apply(result: result)
+                }
+            } catch {
+                await MainActor.run {
+                    model?.isTranslating = false
+                    model?.statusReason = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    /// Called by the model whenever the user picks a different source
+    /// or target language from the overlay dropdowns. Persists the new
+    /// choice to settings (so it's the default for next time) and
+    /// re-runs translation live.
+    private func handleLanguageChange(source: String, target: String) {
+        settingsRef?.translateSourceLanguage = source
+        settingsRef?.translateTargetLanguage = target
+        if let model = translatorModel {
+            runTranslation(model: model)
+        }
+    }
+
+    private func dismissTranslationOverlay() {
+        translatorPanel?.orderOut(nil)
+        translatorPanel = nil
+        translatorModel = nil
+        translatorImage = nil
     }
 
     /// Kicks off the upload; the toolbar shows progress + result CTAs
@@ -362,6 +607,11 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
     /// uploading, success) so the URL row never visually balloons beyond
     /// the action bar.
     private func uploadAndShare() {
+        // Same rationale as `saveToFile`: the uploaded image is
+        // the underlying selection, not the translated overlay.
+        // Exiting the translation first keeps the UX honest.
+        dismissTranslationOverlay()
+
         guard let session = sessionRef,
               let data = renderAnnotatedSelectionPNG() else { return }
 
@@ -745,25 +995,57 @@ final class LightshotOverlayView: NSView {
             ctx.draw(img, in: bounds)
         }
 
-        // 2. Light dim veil over everything — kept subtle so the real
-        // desktop is still clearly readable through it (matches Lightshot's
-        // ~25-30% dim, NOT a heavy black overlay).
-        ctx.setFillColor(NSColor.black.withAlphaComponent(0.28).cgColor)
+        // 2. Dim veil over everything — bumped to 0.58 so the
+        // non-selected area is firmly de-emphasised while the selection
+        // (which the .clear blend below punches through) reads at full
+        // brightness. The desktop is still faintly readable through it
+        // so the user can orient themselves.
+        ctx.setFillColor(NSColor.black.withAlphaComponent(0.58).cgColor)
         ctx.fill(bounds)
 
-        // 3. Punch a hole in the veil for the selection (image shows through)
+        // 3. Punch a hole in the veil for the selection (image shows
+        // through). Slight corner rounding (3pt) keeps the cutout
+        // edges from feeling hard against the now-darker dim.
         if selection.width > 0, selection.height > 0 {
             ctx.setBlendMode(.clear)
-            ctx.fill(selection)
+            let path = CGPath(
+                roundedRect: selection,
+                cornerWidth: 3, cornerHeight: 3,
+                transform: nil
+            )
+            ctx.addPath(path)
+            ctx.fillPath()
             ctx.setBlendMode(.normal)
         }
 
         // 4. Selection border + dimensions chip + (annotating) corner handles.
         if selection.width > 0, selection.height > 0 {
             let accent = NSColor(srgbRed: 0.06, green: 0.45, blue: 0.95, alpha: 1) // Lightshot blue
+            // Soft outer glow around the selection — a wider, low-alpha
+            // stroke under the main border eases the contrast jump from
+            // dimmed area → bright selection.
+            ctx.saveGState()
+            ctx.setStrokeColor(accent.withAlphaComponent(0.30).cgColor)
+            ctx.setLineWidth(5)
+            let glowPath = CGPath(
+                roundedRect: selection,
+                cornerWidth: 3, cornerHeight: 3,
+                transform: nil
+            )
+            ctx.addPath(glowPath)
+            ctx.strokePath()
+            ctx.restoreGState()
+            // Main border — slightly thinner than before (1.5pt) and on
+            // a rounded path so corners match the cutout.
             ctx.setStrokeColor(accent.cgColor)
-            ctx.setLineWidth(2)
-            ctx.stroke(selection)
+            ctx.setLineWidth(1.5)
+            let borderPath = CGPath(
+                roundedRect: selection,
+                cornerWidth: 3, cornerHeight: 3,
+                transform: nil
+            )
+            ctx.addPath(borderPath)
+            ctx.strokePath()
 
             // Dimensions chip — sticky during the initial drag so the user
             // can see what they're framing. Hidden in annotating phase since
@@ -820,9 +1102,16 @@ final class LightshotOverlayView: NSView {
 
 private struct LightshotToolbar: View {
     @ObservedObject var session: AnnotationSession
+    /// Optional — used by the inline translator UI to read default
+    /// source / target languages and update them on the fly.
+    weak var settings: SettingsManager?
     let onCopy: () -> Void
     let onSave: () -> Void
     let onUpload: () -> Void
+    /// Fire-and-forget — opens the magic translation overlay on top of
+    /// the selection rect. Live re-translate and language pickers live
+    /// inside the overlay itself, not in the toolbar.
+    let onTranslate: () -> Void
     let onClose: () -> Void
 
     // Inline mini-palette
@@ -945,13 +1234,14 @@ private struct LightshotToolbar: View {
 
             divider
 
-            // Copy / Save / Upload
+            // Copy / Save / Upload / Translate
             ToolbarIconButton(symbol: "doc.on.doc.fill", isActive: false, action: onCopy)
                 .help("Copy to clipboard")
             ToolbarIconButton(symbol: "square.and.arrow.down.fill", isActive: false, action: onSave)
                 .help("Save to file")
             ToolbarIconButton(symbol: "icloud.and.arrow.up.fill", isActive: false, action: onUpload)
                 .help("Upload & share URL")
+            translateButton
 
             divider
 
@@ -959,6 +1249,24 @@ private struct LightshotToolbar: View {
             ToolbarIconButton(symbol: "xmark", isActive: false, action: onClose)
                 .help("Cancel")
         }
+    }
+
+    // MARK: - Translate button + popover
+
+    /// The translate button is two halves in one capsule:
+    ///   • the globe icon (left) — kicks off OCR + translation
+    ///   • a small "SV→EN" chip (right) — opens an inline picker so the
+    ///     user can swap languages on the fly without going to Settings.
+    /// The result popover anchors to the whole control.
+    @ViewBuilder
+    private var translateButton: some View {
+        // Single icon button — opens the magic translation overlay
+        // panel on top of the selection rect. All the rich UI (language
+        // dropdowns, per-text-block overlay, shimmer animation, live
+        // re-translate) lives over there now, so the toolbar can stay
+        // visually consistent with the other action icons.
+        ToolbarIconButton(symbol: "globe", isActive: false, action: onTranslate)
+            .help("Translate selection (overlay)")
     }
 
     // MARK: - Upload-state panels
@@ -1781,4 +2089,13 @@ final class _CanvasNSView: NSView {
         for item in s.items { AnnotationSession.draw(item: item, in: bounds) }
         if let c = currentItem { AnnotationSession.draw(item: c, in: bounds) }
     }
+}
+
+/// Non-activating panel that hosts the magic translation overlay.
+/// Borderless + transparent so only the SwiftUI content paints, and
+/// `canBecomeKey = false` keeps focus on whatever the user was last
+/// looking at (consistent with the screenshot toolbar panel).
+final class TranslationOverlayPanelWindow: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
 }
