@@ -2885,7 +2885,7 @@ private struct WorldClockEditor: View {
                         .foregroundColor(.secondary)
                     }
                     .buttonStyle(.plain)
-                    .help("Restore Local + Stockholm")
+                    .help("Restore Local + Dhaka")
                 }
             }
             .padding(.top, 4)

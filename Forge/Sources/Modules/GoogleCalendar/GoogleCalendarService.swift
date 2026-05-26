@@ -1125,7 +1125,15 @@ final class GoogleCalendarService: NSObject, ObservableObject {
 // MARK: - Keychain (refresh + access tokens, scoped per email)
 
 enum GoogleKeychain {
-    private static let service = "com.strativ.forge.google"
+    /// Keychain "service" identifier. Bumped from the legacy
+    /// `com.strativ.forge.google` when we renamed the bundle ID
+    /// to `com.toolkit.forge`. Existing entries under the old
+    /// service string remain on disk but inaccessible to the
+    /// renamed app — by design, macOS Keychain scopes secrets by
+    /// the code-signing identity + service string. Users will
+    /// simply re-connect Google accounts once on first launch
+    /// under the new bundle.
+    private static let service = "com.toolkit.forge.google"
 
     static func store(email: String, accessToken: String, refreshToken: String, expiresIn: Int) {
         set(value: accessToken,  account: "\(email)|access")
@@ -1208,7 +1216,7 @@ final class LoopbackOAuthServer {
     var onResult: ((Result<[String: String], Error>) -> Void)?
 
     private var listener: NWListener?
-    private let queue = DispatchQueue(label: "com.strativ.forge.oauth-loopback")
+    private let queue = DispatchQueue(label: "com.toolkit.forge.oauth-loopback")
     private var fired = false
 
     enum LoopbackError: LocalizedError {

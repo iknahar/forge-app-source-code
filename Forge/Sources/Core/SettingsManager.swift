@@ -46,10 +46,11 @@ final class SettingsManager: ObservableObject {
         didSet { save() }
     }
 
-    /// Screenshot Translator — source language (auto-detect when empty).
-    /// Stored as a BCP-47 code (e.g. "sv", "en", "es"). Defaults to
-    /// Swedish per the brand's primary market.
-    @Published var translateSourceLanguage: String = "sv" {
+    /// Screenshot Translator — source language. Stored as a BCP-47
+    /// code (e.g. "auto", "en", "bn"). Default is "auto" so the
+    /// translator detects whatever the user just selected without
+    /// requiring per-language setup.
+    @Published var translateSourceLanguage: String = "auto" {
         didSet { save() }
     }
 
@@ -88,7 +89,7 @@ final class SettingsManager: ObservableObject {
     @Published var eventDotStyle: EventDotStyle = .multiple { didSet { save() } }
     @Published var calendarTextScale: Double = 1.0     { didSet { save() } }
 
-    /// User's chosen world clock cities. Defaults to Local + Stockholm.
+    /// User's chosen world clock cities. Defaults to Local + Dhaka.
     @Published var worldClockCities: [WorldClockCity] = WorldClockCity.defaults {
         didSet { save() }
     }
@@ -563,8 +564,8 @@ struct WorldClockCity: Codable, Equatable, Identifiable {
     var isLocal: Bool { timeZoneId.isEmpty }
 
     static let defaults: [WorldClockCity] = [
-        WorldClockCity(label: "Local",     timeZoneId: ""),
-        WorldClockCity(label: "Stockholm", timeZoneId: "Europe/Stockholm"),
+        WorldClockCity(label: "Local", timeZoneId: ""),
+        WorldClockCity(label: "Dhaka", timeZoneId: "Asia/Dhaka"),
     ]
 
     /// Common picker presets shown in Settings.

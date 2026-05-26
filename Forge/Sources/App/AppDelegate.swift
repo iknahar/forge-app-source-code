@@ -22,6 +22,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     // `AppDelegate.shared` instead of `NSApp.delegate`.
     static var shared: AppDelegate?
 
+    // MARK: - Bundle-ID migration
+    //
+    // Forge originally shipped under `com.strativ.forge`. After the
+    // rename to `com.toolkit.forge`, macOS stores
+    // NSUserDefaults under a *new* file
+    // (`~/Library/Preferences/com.toolkit.forge.plist`) — the old
+    // file becomes orphaned. Same story for the suite identifier
+    // used by SettingsManager. Without migration, every user who
+    // upgrades from the old build sees a fresh-install: empty
+    // shortcuts, default menu bar tokens, no world clock cities,
+    // calendar disconnected, etc.
+    //
+    // This routine copies every key from the legacy domain into
+    // the current one ONCE on first launch under the new bundle.
+    // After the copy, a sentinel key prevents it from running
+    // again. The legacy plist is left in place (we don't delete
+    // user data) and quietly ignored by AppKit going forward.
+    //
+    // Note: this can't migrate the Keychain entries (Apple's
+    // Keychain scopes secrets by code-signing identity, which
+    // changes with the bundle ID). Users have to reconnect Google
+    // once; everything else carries over.
+
+    private static let migrationSentinelKey = "forge.bundleRenameMigration.v1"
+    private static let legacyBundleId = "com.strativ.forge"
+
+    private static func migrateLegacyDefaultsIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: migrationSentinelKey) else { return }
+        guard let legacy = UserDefaults(suiteName: legacyBundleId) else {
+            defaults.set(true, forKey: migrationSentinelKey)
+            return
+        }
+        let legacyDict = legacy.dictionaryRepresentation()
+        guard !legacyDict.isEmpty else {
+            // Fresh install (no legacy data) — just stamp the
+            // sentinel so we don't keep checking on every launch.
+            defaults.set(true, forKey: migrationSentinelKey)
+            return
+        }
+        var copied = 0
+        for (key, value) in legacyDict {
+            // Skip Apple-managed `Apple…` keys — those are
+            // per-process settings macOS sets automatically and
+            // shouldn't be cross-loaded.
+            if key.hasPrefix("Apple") || key.hasPrefix("NS") { continue }
+            // Don't clobber any value the new bundle already wrote
+            // (e.g. from a previous partial launch).
+            if defaults.object(forKey: key) != nil { continue }
+            defaults.set(value, forKey: key)
+            copied += 1
+        }
+        defaults.set(true, forKey: migrationSentinelKey)
+        print("[Forge] migrateLegacyDefaults: copied \(copied) keys from \(legacyBundleId)")
+    }
+
     // MARK: - Properties
 
     private var statusItem: NSStatusItem!
@@ -58,6 +114,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         print("[Forge] applicationDidFinishLaunching START")
         // Hide from Dock — Forge is menu-bar-only
         NSApp.setActivationPolicy(.accessory)
+
+        // One-shot migration after the 2026 bundle-ID rename (legacy
+        // `com.strativ.forge` → current `com.toolkit.forge`). Runs
+        // before SettingsManager touches UserDefaults so settings
+        // are preserved across the rename.
+        Self.migrateLegacyDefaultsIfNeeded()
 
         setupMenuBar()
         print("[Forge] setupMenuBar done. statusItem=\(statusItem != nil) button=\(statusItem?.button != nil)")

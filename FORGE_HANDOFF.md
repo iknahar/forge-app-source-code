@@ -1,6 +1,6 @@
 # Forge — Session Handoff
 
-A macOS menu-bar productivity utility (Swift/SwiftUI/AppKit, deployment target macOS 14). Built for the **Strativ design team** (Stockholm + Dhaka, Swedish IT consultancy). This document hands off the project state so any new session can continue without losing context.
+A macOS menu-bar productivity utility (Swift/SwiftUI/AppKit, deployment target macOS 14). Built by an independent developer based in Bangladesh. This document hands off the project state so any new session can continue without losing context.
 
 ---
 
@@ -9,7 +9,7 @@ A macOS menu-bar productivity utility (Swift/SwiftUI/AppKit, deployment target m
 ```
 Project root:     /Users/strativa/Desktop/macos-app/
 Xcode project:    Forge.xcodeproj   (regenerated from project.yml via xcodegen)
-Bundle ID:        com.strativ.forge  (rename pending — see §10)
+Bundle ID:        com.toolkit.forge  (renamed from legacy com.strativ.forge — see §10)
 Deployment:       macOS 14+
 LSUIElement:      true (menu-bar only, no Dock icon)
 ```
@@ -41,7 +41,7 @@ When adding new `.swift` files, **always** run `xcodegen generate` before buildi
 ```
 Forge/
 ├── Resources/
-│   └── Info.plist                            # CFBundleIdentifier = com.strativ.forge
+│   └── Info.plist                            # CFBundleIdentifier = com.toolkit.forge
 └── Sources/
     ├── App/
     │   ├── AppDelegate.swift                 # Status item, popover, hotkey wiring, module registration
@@ -187,7 +187,7 @@ Forge's main popover wraps content in `ScrollableContainer` (NSScrollView shim) 
 ### Theme + persistence
 
 - ✅ Every setting persists to `~/Library/Application Support/Forge/settings.json` via `PersistedSettings` Codable struct.
-- ✅ Google tokens in Keychain under service `com.strativ.forge.google`.
+- ✅ Google tokens in Keychain under service `com.toolkit.forge.google` (legacy tokens under `com.strativ.forge.google` are orphaned after the rename — users reconnect once).
 - ✅ Clipboard history in `UserDefaults` keyed `clipboard.history` (text + 20-most-recent image blobs).
 - ✅ FancyZones layouts in `~/Library/Application Support/Forge/fancyzones_layouts.json` (templates + custom layouts + active layout ref).
 
@@ -339,7 +339,6 @@ Standard approach for all macOS always-on-top utilities (Magnet, Rectangle Pro, 
 
 | Item | Effort | Why |
 |---|---|---|
-| **Bundle ID rename** (`com.strativ` → `com.kahar` or chosen) | 30 min | See §10. User explicitly deferred this. Touches `project.yml` (3 lines), `Info.plist` (2 lines), `GoogleCalendarService.swift` (2 lines). Side effect: needs Accessibility re-grant + Google OAuth tokens re-fetched. |
 | **Per-monitor FancyZones preferences** | ~1 day | `defaultHorizontal` / `defaultVertical` stars are persisted but ignored at snap time. Needs a real per-monitor data model: `[NSScreen.id → ActiveLayout]` instead of one global `activeLayoutRef`. |
 | **Workspaces** (`WindowManagerModule.saveCurrentWorkspace` / `launchWorkspace`) | ~1 day | Backend wired, no UI. Add a settings panel for "Save current arrangement as workspace X" + named list. |
 | **Mouse Highlight crosshairs** (`crosshairsEnabled`) | ~½ day | Module supports it, no UI toggle. Add to Settings → Shortcuts → Mouse & Highlights group, or a separate Settings section. |
@@ -348,7 +347,7 @@ Standard approach for all macOS always-on-top utilities (Magnet, Rectangle Pro, 
 
 ## 9. Distribution + OAuth strategy
 
-Forge ships with a bundled Google OAuth Client ID (`GoogleCalendarService.defaultClientID`) under `com.strativ.forge`'s Cloud project. Google's rules:
+Forge ships with a bundled Google OAuth Client ID (`GoogleCalendarService.defaultClientID`) under the developer's Cloud project. Google's rules:
 
 | State | Who can sign in | Action |
 |---|---|---|
@@ -367,25 +366,23 @@ The `SettingsManager.clientID` override field already exists for power users who
 
 ---
 
-## 10. Bundle ID rename — to-do list when triggered
+## 10. Bundle ID rename — completed 2026-05-26
 
-User asked about renaming `com.strativ.forge` to something else (e.g. `com.kahar.forge`, `se.strativa.forge`). Six file locations to update:
+Forge was renamed from the legacy `com.strativ.forge` to `com.toolkit.forge`. Six file locations updated:
 
-| File | Line | Change |
-|---|---|---|
-| `project.yml` | 3 | `bundleIdPrefix:` |
-| `project.yml` | 25 | `PRODUCT_BUNDLE_IDENTIFIER:` (main target) |
-| `project.yml` | 57 | `PRODUCT_BUNDLE_IDENTIFIER:` (tests target) |
-| `Forge/Resources/Info.plist` | 10, 56 | `<string>com.strativ.forge</string>` (twice) |
-| `Forge/Sources/Modules/GoogleCalendar/GoogleCalendarService.swift` | 1126 | `private static let service = "com.strativ.forge.google"` |
-| `Forge/Sources/Modules/GoogleCalendar/GoogleCalendarService.swift` | 1209 | `DispatchQueue(label: "com.strativ.forge.oauth-loopback")` (cosmetic) |
+| File | Change |
+|---|---|
+| `project.yml` | `bundleIdPrefix:` + main target `PRODUCT_BUNDLE_IDENTIFIER:` + tests target `PRODUCT_BUNDLE_IDENTIFIER:` |
+| `Forge/Resources/Info.plist` | `CFBundleIdentifier` + the OAuth callback URL scheme entry |
+| `Forge/Sources/Modules/GoogleCalendar/GoogleCalendarService.swift` | `GoogleKeychain.service` + OAuth loopback `DispatchQueue` label |
+| `Forge/Sources/App/AppDelegate.swift` | Added `migrateLegacyDefaultsIfNeeded()` — one-shot UserDefaults migration so settings carry over |
 
-Then `xcodegen generate && xcodebuild ... build`.
+After the change, `xcodegen generate && xcodebuild ... build` rebuilds the project under the new bundle ID.
 
-**Side effects to communicate:**
-- All Accessibility / Screen Recording permissions need re-granting (keyed to bundle ID).
-- Existing Google OAuth tokens become inaccessible (Keychain entries under old service string). User has to reconnect Google accounts. UserDefaults migration optional: `cp ~/Library/Preferences/com.strativ.forge.plist ~/Library/Preferences/com.NEW.forge.plist`.
-- Bundled OAuth Client ID still belongs to my Cloud project unless they create their own.
+**Side effects that came with the rename:**
+- Accessibility / Screen Recording permissions must be re-granted (macOS keys these to the bundle ID).
+- Google OAuth tokens in the Keychain become inaccessible — macOS Keychain scopes secrets by code-signing identity + service string. Users reconnect Google accounts once. (Automated UserDefaults migration handles the rest.)
+- The bundled OAuth Client ID still belongs to the developer's Cloud project; users with their own Cloud project can paste their Client ID into Settings → Calendar → Google → "Advanced".
 
 ---
 
@@ -431,10 +428,10 @@ pgrep -lf "Debug/Forge.app/Contents/MacOS/Forge"
 
 ## 13. User context — who is this for?
 
-- **Strativ** — Swedish IT consultancy, offices in Stockholm + Dhaka.
-- Team email: `team-design@strativ.se`.
-- Brand: Strativ red (`#E72903` — the Forge accent), Expletus Sans + Inter typography.
-- The app is being built as an internal tool for the design team, with intent to eventually distribute publicly (hence the OAuth verification path).
+- **Owner / sole developer:** an independent developer based in Bangladesh (`heykamrun@gmail.com`).
+- Distribution intent: public via a marketing landing page (`/Users/strativa/Desktop/landing/`), free during beta, paid one-time licence at GA.
+- Brand: vermillion red (`#E72903` — the Forge accent), Instrument Serif + Inter typography.
+- No corporate affiliation; this is one person's indie macOS tool. The OAuth verification path is for public distribution, not internal use.
 - Today's working date during session: 2026-05-25.
 
 ---
@@ -445,7 +442,7 @@ pgrep -lf "Debug/Forge.app/Contents/MacOS/Forge"
 - Last running PID: 19642 from Debug build path.
 - Open bugs: **1** (FancyZones AX permission — see §6).
 - Open feature requests: **3** (text expander, screen recording, Ollama AI — see §8 Tier 2).
-- Bundle ID: still `com.strativ.forge` (rename deferred).
+- Bundle ID: `com.toolkit.forge` (renamed from legacy `com.strativ.forge` — see §10).
 - Google OAuth: still in Testing state with bundled Client ID.
 
 ---

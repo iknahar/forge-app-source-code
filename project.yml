@@ -1,6 +1,6 @@
 name: Forge
 options:
-  bundleIdPrefix: com.strativ
+  bundleIdPrefix: com.toolkit
   deploymentTarget:
     macOS: "14.0"
   xcodeVersion: "15.2"
@@ -22,7 +22,7 @@ targets:
         type: group
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.strativ.forge
+        PRODUCT_BUNDLE_IDENTIFIER: com.toolkit.forge
         PRODUCT_NAME: Forge
         MARKETING_VERSION: "1.0.0"
         CURRENT_PROJECT_VERSION: 1
@@ -54,7 +54,7 @@ targets:
       - target: Forge
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.strativ.forge.tests
+        PRODUCT_BUNDLE_IDENTIFIER: com.toolkit.forge.tests
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Forge.app/Contents/MacOS/Forge"
         BUNDLE_LOADER: "$(TEST_HOST)"
 
