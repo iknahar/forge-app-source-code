@@ -19,11 +19,14 @@ final class SettingsManager: ObservableObject {
         didSet { save() }
     }
 
-    /// Menu bar tokens shown next to the menu-bar icon. Defaults
-    /// to Icon + Next Event — the most useful pair for the
-    /// fresh-install experience: people see Forge's mark and the
-    /// next meeting at a glance.
-    @Published var menuBarTokens: [MenuBarToken] = [.icon, .nextEvent] {
+    /// Menu bar tokens shown next to the menu-bar icon. Defaults to
+    /// Icon + Ongoing Meeting + Next Event. Ordered this way so a
+    /// live event (with its red ● cue) always wins the leftmost slot;
+    /// the next event slides in once nothing is currently happening.
+    /// This pair is what users expect on a fresh install — "what am
+    /// I in right now, and what's next" — and matches the marketing
+    /// page promise of "your day in your menu bar."
+    @Published var menuBarTokens: [MenuBarToken] = [.icon, .ongoingMeeting, .nextEvent] {
         didSet { save() }
     }
 

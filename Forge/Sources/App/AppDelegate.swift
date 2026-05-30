@@ -94,6 +94,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     private var menuBarFormatObserver: AnyCancellable?
     private var menuBarSepObserver: AnyCancellable?
     private var menuBarEmojiObserver: AnyCancellable?
+    /// Re-renders the menu bar whenever the calendar's published
+    /// `events` array changes. Without this the chip would render
+    /// once at launch (when events are typically empty / not yet
+    /// fetched) and stay frozen until the user toggled a setting
+    /// or the 30s refresh timer fired. The user reads the chip
+    /// well before either of those naturally happens, so we
+    /// observe the source-of-truth directly.
+    private var calendarEventsObserver: AnyCancellable?
     private var menuBarRefreshTimer: Timer?
 
     /// Live-pulse state for the "● Ongoing meeting" indicator.
@@ -660,6 +668,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         menuBarEmojiObserver = settingsManager.$menuBarEmoji.dropFirst().sink { [weak self] _ in
             DispatchQueue.main.async { self?.refreshMenuBar() }
         }
+
+        // ── Calendar event observer ──────────────────────────────────────
+        //
+        // Re-render the menu bar the moment events arrive from
+        // EventKit / Google. Critical for the first-launch and
+        // post-permission-grant flow: the user grants Calendar
+        // access, events fetch asynchronously, and without this
+        // observer the chip would silently stay blank until the
+        // 30s timer or a user-driven settings change.
+        //
+        // `removeDuplicates` on event-id arrays would be ideal but
+        // CalendarEvent.id is enough — Combine's default `===`
+        // semantics on arrays already short-circuit when the array
+        // hasn't reallocated. We debounce minimally (50ms) so a
+        // bulk update doesn't trigger N consecutive refreshes when
+        // the calendar layer batches multiple `events =` writes.
+        if let calendar = moduleRegistry.module(ofType: CalendarModule.self) {
+            calendarEventsObserver = calendar.$events
+                .dropFirst()
+                .debounce(for: .milliseconds(50), scheduler: DispatchQueue.main)
+                .sink { [weak self] _ in
+                    self?.refreshMenuBar()
+                }
+        }
     }
 
     private func startMenuBarRefreshTimer() {
@@ -683,7 +715,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             let s = renderMenuBarToken(token)
             return s.isEmpty ? nil : s
         }
-        let titleText = renderedParts.joined(separator: settingsManager.menuBarSeparator)
+        var titleText = renderedParts.joined(separator: settingsManager.menuBarSeparator)
+
+        // Final-length safety net. NSStatusItem auto-fits its width to
+        // the title, but macOS hides the entire item when the menu
+        // bar gets crowded and a status item exceeds the system's
+        // available width budget. The result the user sees: a
+        // completely blank chip instead of a truncated event title.
+        // Per-token truncation isn't enough — two adjacent long
+        // tokens can still compose past the threshold. Clamp the
+        // composed string with a trailing ellipsis so the chip is
+        // always visible, always readable.
+        let kMenuBarTitleMaxLen = 60
+        if titleText.count > kMenuBarTitleMaxLen {
+            titleText = String(titleText.prefix(kMenuBarTitleMaxLen - 1)) + "…"
+        }
 
         let shouldShowIcon = tokens.contains(.icon) || renderedParts.isEmpty
         let userEmoji = settingsManager.menuBarEmoji.trimmingCharacters(in: .whitespacesAndNewlines)

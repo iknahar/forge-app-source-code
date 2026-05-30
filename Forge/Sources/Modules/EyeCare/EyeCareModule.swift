@@ -123,7 +123,12 @@ final class EyeCareModule: ForgeModule, ObservableObject {
     let description = "Timed breaks plus warm-tint screen filter to ease eye strain"
     let iconName    = "eye.fill"
     let category: ModuleCategory = .calendar
-    var isEnabled: Bool = true
+    // Off by default — break overlays and screen tinting are
+    // intrusive enough that users should opt in rather than
+    // discover them mid-task. The Settings → Eye Care toggle
+    // is the on-ramp; everything else (durations, snooze choices,
+    // tint temperature) stays disabled until the master is on.
+    var isEnabled: Bool = false
 
     // MARK: - Persisted (mirrored from EyeCareConfig)
 
