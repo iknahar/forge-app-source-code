@@ -1143,6 +1143,24 @@ enum GoogleKeychain {
     /// under the new bundle.
     private static let service = "com.toolkit.forge.google"
 
+    /// In-memory cache of secret values, keyed by account string
+    /// ("email|access" / "email|refresh").
+    ///
+    /// WHY: macOS prompts for authorization on EVERY `SecItemCopyMatching`
+    /// when the running app's code signature isn't on the keychain item's
+    /// access-control list. With ad-hoc / unstable signing that signature
+    /// changes on each rebuild, so the grant never sticks — and because the
+    /// Calendar module re-reads the token on a 15s timer (and on every view
+    /// appearance), the user gets buried under repeated "Forge wants to use
+    /// your confidential information" dialogs.
+    ///
+    /// Caching the value after the first successful read means we touch the
+    /// keychain at most once per launch per item, turning a prompt storm
+    /// into a single prompt (which a stable signing identity then makes
+    /// persistent via "Always Allow").
+    private static var memCache: [String: String] = [:]
+    private static let cacheLock = NSLock()
+
     static func store(email: String, accessToken: String, refreshToken: String, expiresIn: Int) {
         set(value: accessToken,  account: "\(email)|access")
         if !refreshToken.isEmpty { set(value: refreshToken, account: "\(email)|refresh") }
@@ -1166,6 +1184,10 @@ enum GoogleKeychain {
     // MARK: low-level
 
     private static func set(value: String, account: String) {
+        // Update the in-memory cache first so subsequent reads this launch
+        // never hit the keychain (and never re-prompt).
+        cacheLock.lock(); memCache[account] = value; cacheLock.unlock()
+
         let data = Data(value.utf8)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -1179,6 +1201,12 @@ enum GoogleKeychain {
     }
 
     private static func get(account: String) -> String? {
+        // Serve from the in-memory cache when we already read this value
+        // this launch — this is what stops the repeated keychain prompts.
+        cacheLock.lock()
+        if let cached = memCache[account] { cacheLock.unlock(); return cached }
+        cacheLock.unlock()
+
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -1191,10 +1219,16 @@ enum GoogleKeychain {
               let data = result as? Data,
               let s = String(data: data, encoding: .utf8)
         else { return nil }
+
+        // Cache the successfully-read value so we don't ask the keychain
+        // (and the user) again for the rest of this launch.
+        cacheLock.lock(); memCache[account] = s; cacheLock.unlock()
         return s
     }
 
     private static func deleteItem(account: String) {
+        cacheLock.lock(); memCache[account] = nil; cacheLock.unlock()
+
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
