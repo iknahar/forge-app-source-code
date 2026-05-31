@@ -11,6 +11,10 @@ struct MenuBarView: View {
     @Environment(\.openSettings) private var openSettings
     @State private var selectedTab: Tab = .calendar
     @State private var isHoveringSettings = false
+    @State private var showConfetti = false
+    /// Tracks whether we already celebrated today so the confetti
+    /// fires at most once per day (not every time the popover opens).
+    @State private var celebratedToday: Date? = nil
 
     enum Tab: String, CaseIterable {
         case calendar = "Calendar"
@@ -19,7 +23,40 @@ struct MenuBarView: View {
 
     var body: some View {
         bodyContent
+            .overlay(ConfettiOverlay(trigger: $showConfetti))
             .preferredColorScheme(settings.theme.colorScheme)
+            .onReceive(NotificationCenter.default.publisher(for: .forgeConfetti)) { _ in
+                showConfetti = true
+            }
+            .onAppear { checkAllMeetingsDone() }
+    }
+
+    /// Fire confetti when the user opens the popover and all of today's
+    /// meetings have already ended. This is SAFE — the user initiated
+    /// the popover themselves, so they aren't screen-sharing or in an
+    /// overrun meeting. Fires at most once per calendar day.
+    private func checkAllMeetingsDone() {
+        guard let cal = moduleRegistry.module(ofType: CalendarModule.self) else { return }
+        let now = Date()
+        let calendar = Calendar.current
+
+        // Already celebrated today?
+        if let last = celebratedToday, calendar.isDateInToday(last) { return }
+
+        let todayMeetings = cal.activeEvents.filter {
+            calendar.isDateInToday($0.startDate) && !$0.isAllDay
+        }
+        // Must have had at least one meeting today
+        guard !todayMeetings.isEmpty else { return }
+        // All meetings must have ended
+        let allDone = todayMeetings.allSatisfy { $0.endDate <= now }
+        // Don't fire before noon — feels wrong if your only meeting
+        // was an 8 AM standup.
+        let hour = calendar.component(.hour, from: now)
+        guard allDone && hour >= 12 else { return }
+
+        celebratedToday = now
+        showConfetti = true
     }
 
     private var bodyContent: some View {
@@ -31,6 +68,12 @@ struct MenuBarView: View {
             Rectangle()
                 .fill(ForgeTheme.Colors.borderSubtle)
                 .frame(height: 1)
+
+            // Live workday progress strip — shows how far through the
+            // day you are, with colored blocks for each meeting.
+            if let cal = moduleRegistry.module(ofType: CalendarModule.self) {
+                WorkdayProgressBar(events: cal.activeEvents)
+            }
 
             // Content — NSScrollView-backed so scroll wheel events reach us
             // inside the NSPopover (SwiftUI ScrollView swallows them).
@@ -278,11 +321,8 @@ struct MenuBarView: View {
 
     private var footerBar: some View {
         HStack {
-            // Footer reserved — day progress + bottom hints have been
-            // removed per the latest design decisions.
             Spacer()
         }
-        // Footer matches calendar / tools at zero L/R inset.
         .padding(.vertical, ForgeTheme.Spacing.sm)
     }
 
@@ -438,6 +478,131 @@ struct MenuBarView: View {
 
     private var dayProgressPercent: Int {
         Int(dayProgress * 100)
+    }
+}
+
+// MARK: - Workday Progress Bar
+//
+// A thin animated strip between the header and the scroll content.
+// Shows how far through the workday you are (9 AM → 6 PM) with
+// colored blocks for each meeting, a gradient progress fill, and a
+// pulsing current-time dot. Updates every 30 seconds via TimelineView.
+
+private struct WorkdayProgressBar: View {
+    let events: [CalendarEvent]
+
+    @State private var pulse = false
+
+    private let workStart: Double = 9.0    // 9 AM
+    private let workEnd: Double   = 18.0   // 6 PM
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 30)) { ctx in
+            barContent(now: ctx.date)
+        }
+        .onAppear {
+            withAnimation(.easeInOut(duration: 1.5).repeatForever(autoreverses: true)) {
+                pulse = true
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func barContent(now: Date) -> some View {
+        let cal = Calendar.current
+        let hour = Double(cal.component(.hour, from: now))
+            + Double(cal.component(.minute, from: now)) / 60.0
+        let progress = max(0, min(1, (hour - workStart) / (workEnd - workStart)))
+        let meetings = todayMeetings(on: now)
+
+        VStack(spacing: 4) {
+            GeometryReader { geo in
+                let w = geo.size.width
+
+                ZStack(alignment: .leading) {
+                    // 1. Track background
+                    Capsule()
+                        .fill(ForgeTheme.Colors.surfaceSubtle)
+                        .frame(height: 4)
+
+                    // 2. Elapsed progress fill
+                    if progress > 0 {
+                        Capsule()
+                            .fill(
+                                LinearGradient(
+                                    colors: [
+                                        ForgeTheme.Colors.accent.opacity(0.35),
+                                        ForgeTheme.Colors.accent.opacity(0.55),
+                                    ],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                            .frame(width: max(4, w * progress), height: 4)
+                    }
+
+                    // 3. Meeting blocks — colored segments on the track
+                    ForEach(meetings) { event in
+                        let sx = xFraction(for: event.startDate, cal: cal)
+                        let ex = xFraction(for: event.endDate, cal: cal)
+                        let blockW = max(3, (ex - sx) * w)
+                        let isLive = now >= event.startDate && now < event.endDate
+
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(event.calendarColor.opacity(isLive ? 0.95 : 0.55))
+                            .frame(width: blockW, height: 4)
+                            .offset(x: sx * w)
+                            .shadow(
+                                color: isLive
+                                    ? event.calendarColor.opacity(pulse ? 0.7 : 0.3)
+                                    : .clear,
+                                radius: isLive ? 4 : 0
+                            )
+                    }
+
+                    // 4. Current-time indicator — glowing dot
+                    if progress > 0 && progress < 1 {
+                        Circle()
+                            .fill(ForgeTheme.Colors.accent)
+                            .frame(width: 8, height: 8)
+                            .shadow(
+                                color: ForgeTheme.Colors.accent.opacity(pulse ? 0.7 : 0.25),
+                                radius: pulse ? 6 : 3
+                            )
+                            .offset(x: w * progress - 4, y: 0)
+                    }
+                }
+            }
+            .frame(height: 8)   // 4px bar + room for 8px dot
+
+            // Hour markers
+            HStack {
+                Text("9AM")
+                Spacer()
+                Text("12PM")
+                Spacer()
+                Text("3PM")
+                Spacer()
+                Text("6PM")
+            }
+            .font(.system(size: 8, weight: .medium, design: .rounded))
+            .foregroundColor(ForgeTheme.Colors.textTertiary)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 6)
+    }
+
+    // MARK: Helpers
+
+    private func todayMeetings(on date: Date) -> [CalendarEvent] {
+        let cal = Calendar.current
+        return events.filter { cal.isDateInToday($0.startDate) && !$0.isAllDay }
+    }
+
+    private func xFraction(for date: Date, cal: Calendar) -> CGFloat {
+        let h = Double(cal.component(.hour, from: date))
+            + Double(cal.component(.minute, from: date)) / 60.0
+        return max(0, min(1, (h - workStart) / (workEnd - workStart)))
     }
 }
 

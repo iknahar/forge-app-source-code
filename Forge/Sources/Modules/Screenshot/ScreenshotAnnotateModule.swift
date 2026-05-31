@@ -18,6 +18,18 @@ extension Notification.Name {
     static let forgeAfterScreenshotDismiss  = Notification.Name("forgeAfterScreenshotDismiss")
 }
 
+/// Builds a unique default file name for saved screenshots. Without the
+/// timestamp every "Save to file…" defaults to the same name, so each new
+/// capture either overwrites the last one or forces the user to rename it.
+/// Format: `Forge-Screenshot 2026-05-31 at 14.23.07.png` (POSIX locale so
+/// the digits are stable regardless of the user's region settings).
+func forgeScreenshotDefaultFileName() -> String {
+    let fmt = DateFormatter()
+    fmt.locale = Locale(identifier: "en_US_POSIX")
+    fmt.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
+    return "Forge-Screenshot \(fmt.string(from: Date())).png"
+}
+
 // MARK: - Module
 
 /// Screenshot + Annotate — capture a region of the screen and decorate it with
@@ -51,6 +63,16 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
     /// translator to read source / target language preferences.
     weak var settingsRef: SettingsManager?
 
+    /// Image captured **synchronously** inside the Carbon hotkey handler,
+    /// *before* the `DispatchQueue.main.async` dispatch. By running in the
+    /// same runloop iteration as the key-down event, this preserves
+    /// transient UI (e.g. NSPopover with `.transient` behavior) that would
+    /// auto-dismiss on the very next runloop cycle. `startCapture()` checks
+    /// this first and falls back to an immediate capture if it's `nil`
+    /// (e.g. when the module is triggered programmatically rather than by
+    /// a hotkey).
+    var hotkeyPreCapture: CGImage?
+
     func activate() {}
     func deactivate() {
         dismissLightshot()
@@ -59,6 +81,16 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
     // MARK: - Capture (Lightshot-style: selection stays in place)
 
     func startCapture() {
+        // If a previous screenshot session is still on screen (e.g. the
+        // user triggered the hotkey again without finishing the first
+        // capture), tear it down completely before starting a new one.
+        // Otherwise stray text panels / overlays leak between sessions —
+        // notably the inline-text editor window, which floats outside
+        // the new selection.
+        if overlayView != nil || regionWindow != nil || sessionRef != nil {
+            dismissLightshot()
+        }
+
         // macOS gates `CGWindowListCreateImage` and ScreenCaptureKit behind
         // the Screen Recording privacy permission. Without it the captured
         // image contains *only* the desktop wallpaper — every app window
@@ -67,24 +99,38 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
         // request and show a guidance alert instead of pushing a useless
         // dark overlay.
         guard CGPreflightScreenCaptureAccess() else {
-            // Triggers the system permission dialog the first time it's
-            // called; subsequent calls are a no-op.
             _ = CGRequestScreenCaptureAccess()
             presentScreenRecordingAlert()
             return
         }
 
-        // Ask other transient overlays (Mouse Highlight, Find My Mouse,
-        // etc.) to dismiss BEFORE we read pixels — otherwise their visuals
-        // get baked into the captured image.
+        // ── Use the pre-captured image if available ────────────────
+        // The hotkey handler captures the screen synchronously in the
+        // Carbon event callback — before any runloop cycle that would
+        // dismiss transient UI (like the Forge menu-bar popover). If
+        // that image exists, prefer it. Otherwise fall back to an
+        // immediate capture (for programmatic triggers, retry, etc.).
+        let earlyImage: CGImage?
+        if let pre = hotkeyPreCapture {
+            earlyImage = pre
+            hotkeyPreCapture = nil   // consume it — one-shot
+        } else {
+            guard let screen = NSScreen.main else { return }
+            earlyImage = CGWindowListCreateImage(
+                screen.frame, .optionOnScreenOnly, kCGNullWindowID, [.bestResolution]
+            )
+        }
+
+        // NOW dismiss other Forge overlays (mouse highlight, etc.)
+        // so they don't interfere with the annotation overlay. Their
+        // visuals are already baked into `earlyImage` above — that's
+        // acceptable since they're part of what the user sees on screen.
         NotificationCenter.default.post(name: .forgeBeforeScreenshotCapture, object: nil)
 
-        // Let the runloop drain so AppKit actually removes those overlay
-        // windows from the display before we sample the screen. Without
-        // this short hop the spotlight ring would still appear in the
-        // captured pixels because the orderOut hasn't been flushed yet.
+        // Short hop to let overlay orderOut flush, then show the
+        // annotation overlay with the already-captured image.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            self?.performCapture()
+            self?.performCapture(preCaptured: earlyImage)
         }
     }
 
@@ -112,25 +158,24 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
         }
     }
 
-    private func performCapture() {
+    /// - Parameter preCaptured: An image grabbed before overlays were
+    ///   dismissed. If `nil`, a fresh capture is taken now (fallback).
+    private func performCapture(preCaptured: CGImage? = nil) {
         guard let screen = NSScreen.main else { return }
 
-        // Use a view-local rect with origin (0, 0) for our local drawing
-        // coordinate system; the WINDOW gets positioned in screen space.
         let screenFrame = screen.frame
         let viewFrame = NSRect(origin: .zero, size: screenFrame.size)
 
-        guard let image = CGWindowListCreateImage(
+        // Use the early-captured image if available; fall back to a
+        // fresh capture (e.g. if called directly for a retry).
+        let image: CGImage
+        if let pre = preCaptured, pre.width >= 8, pre.height >= 8 {
+            image = pre
+        } else if let fresh = CGWindowListCreateImage(
             screenFrame, .optionOnScreenOnly, kCGNullWindowID, [.bestResolution]
-        ) else {
-            NotificationCenter.default.post(name: .forgeAfterScreenshotDismiss, object: nil)
-            presentScreenRecordingAlert()
-            return
-        }
-        // Sanity-check: if the captured image is degenerate (tiny / 0×0),
-        // we lost access mid-flight. Bail with the guidance alert rather
-        // than showing a black overlay.
-        if image.width < 8 || image.height < 8 {
+        ), fresh.width >= 8, fresh.height >= 8 {
+            image = fresh
+        } else {
             NotificationCenter.default.post(name: .forgeAfterScreenshotDismiss, object: nil)
             presentScreenRecordingAlert()
             return
@@ -250,6 +295,12 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
     }
 
     private func dismissLightshot() {
+        // Commit any in-progress inline text before tearing down.
+        // Also force-dismiss the text panel so it doesn't leak to the
+        // next session (even if the text was empty / already committed).
+        overlayView?.commitActiveText()
+        overlayView?.forceCloseTextPanel()
+
         NSCursor.pop()
         regionWindow?.orderOut(nil);   regionWindow = nil
         toolbarWindow?.orderOut(nil);  toolbarWindow = nil
@@ -271,6 +322,10 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
     /// "blue bar" the user reported). A direct `CGContext` at pixel
     /// resolution is fully reliable.
     private func renderAnnotatedSelectionPNG() -> Data? {
+        // Commit any in-progress inline text BEFORE rendering so the
+        // active text item is included in session.items.
+        overlayView?.commitActiveText()
+
         guard
             let view = overlayView,
             let session = sessionRef,
@@ -307,26 +362,22 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
             bitmapInfo: bitmapInfo
         ) else { return nil }
 
-        // 3) Draw the cropped pixels to fill the canvas. The bitmap context
-        // has top-left origin; CGContext.draw matches the destination rect
-        // size, so the cropped image lands upright.
+        // 3) Draw the cropped pixels.
         ctx.interpolationQuality = .high
         ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: pixelW, height: pixelH))
 
         // 4) Bake annotations.
-        //
-        //    Annotations are stored in SCREEN-point coords with a bottom-left
-        //    origin (matching the overlay view). The bitmap context is in
-        //    pixels with a top-left origin. Convert:
-        //      a) Flip Y so we can use bottom-left point arithmetic.
-        //      b) Scale points → pixels.
-        //      c) Translate so the selection's bottom-left maps to (0, 0).
-        //
-        //    We bridge an NSGraphicsContext on top of the CGContext so the
-        //    existing AppKit-based AnnotationSession.draw routines work.
+        //    CTM: scale points→pixels + shift selection to origin.
+        //    CRUCIALLY: NO negative-Y scale.  CGContext already
+        //    implicitly flips Y when going from its device space
+        //    (origin bottom-left, Y up) to the pixel buffer (origin
+        //    top-left). Adding `scaleBy(y: -scale)` was a SECOND
+        //    flip that made text glyphs render upside-down. With
+        //    plain positive scale the CG flip alone handles the
+        //    AppKit-Y-up → image-Y-down conversion, and shapes,
+        //    images, and text all render upright.
         ctx.saveGState()
-        ctx.translateBy(x: 0, y: CGFloat(pixelH))
-        ctx.scaleBy(x: scale, y: -scale)
+        ctx.scaleBy(x: scale, y: scale)
         ctx.translateBy(x: -rect.minX, y: -rect.minY)
 
         let appkitCtx = NSGraphicsContext(cgContext: ctx, flipped: false)
@@ -349,7 +400,16 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
               let image = NSImage(data: data) else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.writeObjects([image])
+        // Satisfying feedback: macOS camera shutter sound
+        Self.playFeedbackSound("Tink")
         dismissLightshot()
+    }
+
+    /// Play a brief system sound as action feedback (non-blocking).
+    static func playFeedbackSound(_ name: String) {
+        if let sound = NSSound(named: NSSound.Name(name)) {
+            sound.play()
+        }
     }
 
     private func saveToFile() {
@@ -366,7 +426,7 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
         guard let data = renderAnnotatedSelectionPNG() else { return }
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.png]
-        panel.nameFieldStringValue = "Forge-Screenshot.png"
+        panel.nameFieldStringValue = forgeScreenshotDefaultFileName()
 
         // Attach the save dialog as a SHEET to the screenshot
         // window rather than running it as a free-floating modal.
@@ -646,6 +706,7 @@ final class LightshotOverlayView: NSView {
 
     enum Corner: CaseIterable {
         case topLeft, topRight, bottomLeft, bottomRight
+        case top, bottom, left, right          // edge midpoints
     }
 
     private enum HitRegion {
@@ -685,7 +746,10 @@ final class LightshotOverlayView: NSView {
                 .store(in: &sessionSubscriptions)
             s.$tool
                 .receive(on: RunLoop.main)
-                .sink { [weak self] _ in self?.applyCursorAtMouse() }
+                .sink { [weak self] _ in
+                    self?.commitActiveText()
+                    self?.applyCursorAtMouse()
+                }
                 .store(in: &sessionSubscriptions)
         }
     }
@@ -700,6 +764,13 @@ final class LightshotOverlayView: NSView {
     private var currentDrawItem: AnnotationItem?
     private var trackingArea: NSTrackingArea?
 
+    // Inline text editing — replaces the old modal NSAlert dialog.
+    // The text view lives in its own tiny panel so it can reliably
+    // become key and receive keyboard input.
+    private var activeTextView: NSTextView?
+    private var activeTextPanel: NSPanel?
+    private var activeTextOrigin: NSPoint = .zero
+
     // Handle visuals
     private let handleSize: CGFloat = 10
     private let handleHitSlop: CGFloat = 6     // generous hit-test margin around handles
@@ -709,7 +780,16 @@ final class LightshotOverlayView: NSView {
     override var isFlipped: Bool { false }   // bottom-left origin; matches screen coords
 
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 { onCancel?() }   // Esc
+        if activeTextView != nil { return }   // text view handles its own Esc
+        if event.keyCode == 53 {              // Esc
+            if session?.tool != nil {
+                // First Esc: exit the current tool → move/resize mode
+                session?.tool = nil
+            } else {
+                // Second Esc: no tool active → close the screenshot
+                onCancel?()
+            }
+        }
     }
 
     // MARK: Tracking (cursor feedback while mouse moves over handles / interior)
@@ -750,12 +830,14 @@ final class LightshotOverlayView: NSView {
             cursor = .crosshair
         case .annotating:
             switch regionAt(p) {
-            case .handle:
-                // macOS doesn't expose diagonal resize cursors publicly;
-                // crosshair reads clearly as "you can resize here".
-                cursor = .crosshair
+            case .handle(let corner):
+                cursor = Self.resizeCursor(for: corner)
             case .interior:
-                cursor = (session?.tool == nil) ? .openHand : .crosshair
+                switch session?.tool {
+                case .none:        cursor = .openHand   // no tool → move/resize mode
+                case .text:        cursor = .iBeam      // text mode → text-insertion cursor
+                case .some:        cursor = .crosshair  // any drawing tool
+                }
             case .outside:
                 cursor = .arrow
             }
@@ -763,10 +845,40 @@ final class LightshotOverlayView: NSView {
         cursor.set()
     }
 
+    /// Returns the appropriate resize cursor for each handle position.
+    /// macOS 14+ exposes `.frameResize(position:directions:)` for proper
+    /// diagonal cursors; on older systems we fall back to the closest
+    /// system cursor.
+    private static func resizeCursor(for corner: Corner) -> NSCursor {
+        if #available(macOS 15, *) {
+            let pos: NSCursor.FrameResizePosition
+            switch corner {
+            case .topLeft:     pos = .topLeft
+            case .topRight:    pos = .topRight
+            case .bottomLeft:  pos = .bottomLeft
+            case .bottomRight: pos = .bottomRight
+            case .top:         pos = .top
+            case .bottom:      pos = .bottom
+            case .left:        pos = .left
+            case .right:       pos = .right
+            }
+            return NSCursor.frameResize(position: pos, directions: [.inward, .outward])
+        }
+        // Fallback for macOS 13 and earlier
+        switch corner {
+        case .top, .bottom:         return .resizeUpDown
+        case .left, .right:         return .resizeLeftRight
+        case .topLeft, .topRight,
+             .bottomLeft, .bottomRight: return .crosshair
+        }
+    }
+
     // MARK: Hit testing
 
     private func handleRect(for corner: Corner) -> NSRect {
         let half = handleSize / 2
+        let midX = selection.midX
+        let midY = selection.midY
         switch corner {
         case .topLeft:
             return NSRect(x: selection.minX - half, y: selection.maxY - half,
@@ -779,6 +891,18 @@ final class LightshotOverlayView: NSView {
                           width: handleSize, height: handleSize)
         case .bottomRight:
             return NSRect(x: selection.maxX - half, y: selection.minY - half,
+                          width: handleSize, height: handleSize)
+        case .top:
+            return NSRect(x: midX - half, y: selection.maxY - half,
+                          width: handleSize, height: handleSize)
+        case .bottom:
+            return NSRect(x: midX - half, y: selection.minY - half,
+                          width: handleSize, height: handleSize)
+        case .left:
+            return NSRect(x: selection.minX - half, y: midY - half,
+                          width: handleSize, height: handleSize)
+        case .right:
+            return NSRect(x: selection.maxX - half, y: midY - half,
                           width: handleSize, height: handleSize)
         }
     }
@@ -798,6 +922,11 @@ final class LightshotOverlayView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
+
+        // Commit any in-progress inline text editor when clicking elsewhere
+        if activeTextView != nil {
+            commitActiveText()
+        }
 
         if phase == .selecting {
             dragStart = p
@@ -824,12 +953,21 @@ final class LightshotOverlayView: NSView {
                 case .brush:
                     item.stroke = [p]
                 case .text:
-                    item.rect.origin = p
-                    item.textSize = s.textSize
-                    item.text = promptForText() ?? ""
-                    if !item.text.isEmpty { s.items.append(item) }
+                    // Click on an existing text item → re-open it for editing
+                    if let idx = textItemIndex(at: p) {
+                        let old = s.items.remove(at: idx)
+                        let attr = old.attributedText ?? NSAttributedString(
+                            string: old.text,
+                            attributes: [
+                                .font: NSFont.systemFont(ofSize: old.textSize, weight: .semibold),
+                                .foregroundColor: old.color
+                            ]
+                        )
+                        beginInlineText(at: old.rect.origin, prefilled: attr)
+                    } else {
+                        beginInlineText(at: p)
+                    }
                     dragMode = .none
-                    needsDisplay = true
                     return
                 }
                 currentDrawItem = item
@@ -897,6 +1035,12 @@ final class LightshotOverlayView: NSView {
         case .none:
             break
         }
+        // Full-view repaint. We tried `setNeedsDisplay(dirtyRect)` for
+        // smoothness, but the overlay window is non-opaque — its
+        // backing store does NOT preserve pixels outside the dirty
+        // rect, so partial repaints left the rest of the screen
+        // transparent and made mouse events fall through to apps
+        // beneath. Keep the full repaint; it's cheap enough.
         needsDisplay = true
     }
 
@@ -913,6 +1057,8 @@ final class LightshotOverlayView: NSView {
             }
             phase = .annotating
             dragMode = .none
+            // Subtle "lock" feedback when the selection is confirmed
+            ScreenshotAnnotateModule.playFeedbackSound("Pop")
             onSelectionComplete?(selection)
 
         case .moving, .resizing:
@@ -959,6 +1105,15 @@ final class LightshotOverlayView: NSView {
         case .bottomRight:
             maxX = max(p.x, minX + minSelectionSide)
             minY = min(p.y, maxY - minSelectionSide)
+        // Edge handles — constrain to a single axis
+        case .top:
+            maxY = max(p.y, minY + minSelectionSide)
+        case .bottom:
+            minY = min(p.y, maxY - minSelectionSide)
+        case .left:
+            minX = min(p.x, maxX - minSelectionSide)
+        case .right:
+            maxX = max(p.x, minX + minSelectionSide)
         }
         return NSRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
     }
@@ -967,14 +1122,163 @@ final class LightshotOverlayView: NSView {
         session?.selectionSize = selection.size
     }
 
-    private func promptForText() -> String? {
-        let alert = NSAlert()
-        alert.messageText = "Add text"
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Add")
-        alert.addButton(withTitle: "Cancel")
-        return alert.runModal() == .alertFirstButtonReturn ? field.stringValue : nil
+    // MARK: Inline text editing
+
+    /// Returns the index (in `session.items`) of the text annotation whose
+    /// bounding box contains `point`, or `nil` if no text item is hit.
+    /// Searches back-to-front so the topmost item wins.
+    private func textItemIndex(at point: NSPoint) -> Int? {
+        guard let s = session else { return nil }
+        for i in s.items.indices.reversed() {
+            let item = s.items[i]
+            guard item.tool == .text else { continue }
+            let attrStr: NSAttributedString
+            if let at = item.attributedText, at.length > 0 {
+                attrStr = at
+            } else if !item.text.isEmpty {
+                attrStr = NSAttributedString(string: item.text, attributes: [
+                    .font: NSFont.systemFont(ofSize: item.textSize, weight: .semibold),
+                    .foregroundColor: item.color
+                ])
+            } else { continue }
+            let size = attrStr.size()
+            let hitRect = NSRect(origin: item.rect.origin, size: size)
+            if hitRect.contains(point) { return i }
+        }
+        return nil
+    }
+
+    /// Places an inline text editor at `point` so the user types directly
+    /// on the screenshot — no modal dialog. The editor lives in its own
+    /// small borderless panel so it can reliably become key and receive
+    /// keyboard input without fighting the overlay's first-responder chain.
+    ///
+    /// - Parameter prefilled: If re-editing an existing text block, pass its
+    ///   attributed string so the editor opens with that content.
+    private func beginInlineText(at point: NSPoint, prefilled: NSAttributedString? = nil) {
+        commitActiveText()           // finalise any previous text editor
+        guard let s = session, let win = self.window else { return }
+
+        let fontSize = s.textSize
+        let font = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
+        let textColor = s.color
+
+        // Available width: from click point to right edge of selection (min 100pt)
+        let availableWidth = max(100, selection.maxX - point.x - 4)
+        let lineHeight = ceil(font.ascender - font.descender + font.leading)
+        let viewHeight = lineHeight + 8
+
+        // ── Build the NSTextView ────────────────────────────────────
+        let tv = NSTextView(frame: NSRect(x: 0, y: 0, width: availableWidth, height: viewHeight))
+        tv.isRichText                       = true
+        tv.allowsUndo                       = true
+        tv.drawsBackground                  = false
+        tv.focusRingType                    = .none
+        tv.isEditable                       = true
+        tv.isSelectable                     = true
+        tv.isVerticallyResizable            = true
+        tv.isHorizontallyResizable          = false
+        tv.textContainerInset               = NSSize(width: 2, height: 2)
+        tv.textContainer?.widthTracksTextView  = true
+        tv.textContainer?.lineFragmentPadding  = 0
+        tv.font                             = font
+        tv.textColor                        = textColor
+        tv.insertionPointColor              = .white  // always visible
+        tv.isAutomaticQuoteSubstitutionEnabled  = false
+        tv.isAutomaticDashSubstitutionEnabled   = false
+        tv.isAutomaticTextReplacementEnabled    = false
+        tv.isAutomaticSpellingCorrectionEnabled = false
+        tv.typingAttributes = [
+            .font: font,
+            .foregroundColor: textColor
+        ]
+        tv.delegate = self
+
+        if let prefilled = prefilled {
+            tv.textStorage?.setAttributedString(prefilled)
+        }
+
+        // ── Host in a tiny borderless key-capable panel ─────────────
+        // Converting the overlay-view point → screen coordinates so the
+        // panel lands exactly on top of the click position.
+        let windowPt  = convert(point, to: nil)
+        let screenPt  = win.convertPoint(toScreen: windowPt)
+        let panelRect = NSRect(x: screenPt.x,
+                               y: screenPt.y,
+                               width: availableWidth,
+                               height: viewHeight)
+
+        let panel = InlineTextPanel(
+            contentRect: panelRect,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level         = win.level + 1   // just above overlay
+        panel.isOpaque      = false
+        panel.backgroundColor = .clear
+        panel.hasShadow     = false
+        panel.contentView   = tv
+
+        // Subtle bottom-line indicator so the user can see the editing area
+        tv.wantsLayer = true
+        let indicator = CALayer()
+        indicator.backgroundColor = NSColor.white.withAlphaComponent(0.35).cgColor
+        indicator.frame = CGRect(x: 0, y: 0, width: availableWidth, height: 1)
+        tv.layer?.addSublayer(indicator)
+
+        panel.orderFront(nil)
+        panel.makeKeyAndOrderFront(nil)
+        panel.makeFirstResponder(tv)
+
+        activeTextView   = tv
+        activeTextOrigin = point
+        activeTextPanel  = panel
+        s.activeTextEditor = tv
+    }
+
+    /// Reads the attributed string from the inline editor, creates an
+    /// `AnnotationItem`, closes the text panel, and returns focus to the overlay.
+    func commitActiveText() {
+        guard let tv = activeTextView, let s = session else { return }
+
+        let plain = tv.string
+        if !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            var item = AnnotationItem(tool: .text, color: s.color, width: s.width)
+            item.rect.origin  = activeTextOrigin
+            item.text         = plain
+            item.textSize     = s.textSize
+            item.attributedText = NSAttributedString(attributedString: tv.attributedString())
+            s.items.append(item)
+        }
+
+        dismissTextPanel()
+    }
+
+    /// Discards the inline editor without creating an annotation.
+    private func cancelActiveText() {
+        guard activeTextView != nil else { return }
+        dismissTextPanel()
+    }
+
+    /// Force-close the text panel without committing. Called from
+    /// `dismissLightshot()` to ensure the panel window is always
+    /// destroyed — even if `commitActiveText()` no-oped because the
+    /// text was empty or already committed.
+    func forceCloseTextPanel() {
+        dismissTextPanel()
+    }
+
+    /// Tears down the inline text panel and hands key status back to the
+    /// overlay window.
+    private func dismissTextPanel() {
+        activeTextPanel?.orderOut(nil)
+        activeTextPanel = nil
+        activeTextView  = nil
+        session?.activeTextEditor = nil
+        window?.makeKeyAndOrderFront(nil)
+        window?.makeFirstResponder(self)
+        needsDisplay = true
     }
 
     // MARK: Draw
@@ -1068,16 +1372,32 @@ final class LightshotOverlayView: NSView {
                 str.draw(at: NSPoint(x: chipRect.minX + 7, y: chipRect.minY + 3))
             }
 
-            // Corner handles — only visible in annotating phase. Filled
-            // white with a blue border, like Lightshot.
+            // Resize handles — only visible in annotating phase. Corner
+            // handles are circles; edge midpoint handles are smaller
+            // rounded rects. All white-filled with a blue border.
             if phase == .annotating {
                 for corner in Corner.allCases {
                     let r = handleRect(for: corner)
                     ctx.setFillColor(NSColor.white.cgColor)
-                    ctx.fillEllipse(in: r)
                     ctx.setStrokeColor(accent.cgColor)
                     ctx.setLineWidth(1.5)
-                    ctx.strokeEllipse(in: r)
+                    switch corner {
+                    case .topLeft, .topRight, .bottomLeft, .bottomRight:
+                        ctx.fillEllipse(in: r)
+                        ctx.strokeEllipse(in: r)
+                    case .top, .bottom, .left, .right:
+                        // Edge handles: smaller rounded rect
+                        let edgeRect = r.insetBy(dx: 1, dy: 1)
+                        let path = CGPath(
+                            roundedRect: edgeRect,
+                            cornerWidth: 2, cornerHeight: 2,
+                            transform: nil
+                        )
+                        ctx.addPath(path)
+                        ctx.fillPath()
+                        ctx.addPath(path)
+                        ctx.strokePath()
+                    }
                 }
             }
         }
@@ -1095,6 +1415,54 @@ final class LightshotOverlayView: NSView {
             }
             ctx.restoreGState()
         }
+    }
+}
+
+/// Tiny borderless panel that hosts the inline text editor. Overrides
+/// `canBecomeKey` so the text view inside can reliably become first
+/// responder and receive keyboard events — borderless windows refuse
+/// key status by default.
+private final class InlineTextPanel: NSPanel {
+    override var canBecomeKey: Bool  { true }
+    override var canBecomeMain: Bool { false }
+}
+
+// MARK: - LightshotOverlayView + NSTextViewDelegate (inline text editing)
+
+extension LightshotOverlayView: NSTextViewDelegate {
+    /// Intercept Return (commit) and Escape (exit text mode) from the inline text editor.
+    func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(insertNewline(_:)) {
+            // Return → commit text, stay in text mode so user can
+            // click to place another text block immediately.
+            commitActiveText()
+            return true
+        }
+        if commandSelector == #selector(cancelOperation(_:)) {
+            // Escape → commit whatever was typed (don't discard),
+            // then exit text mode back to move/resize.
+            commitActiveText()
+            session?.tool = nil
+            return true
+        }
+        return false
+    }
+
+    /// Auto-grow the panel + text view height as the user types.
+    func textDidChange(_ notification: Notification) {
+        guard let tv = activeTextView, let panel = activeTextPanel,
+              let lm = tv.layoutManager, let tc = tv.textContainer
+        else { return }
+        lm.ensureLayout(for: tc)
+        let usedRect = lm.usedRect(for: tc)
+        let newHeight = max(ceil(usedRect.height) + 8, 24)
+        // Resize the panel (screen coords) — keep bottom edge stable.
+        var pFrame = panel.frame
+        let delta  = newHeight - pFrame.height
+        pFrame.origin.y -= delta      // grow upward in screen coords
+        pFrame.size.height = newHeight
+        panel.setFrame(pFrame, display: true)
+        tv.frame = NSRect(origin: .zero, size: pFrame.size)
     }
 }
 
@@ -1188,7 +1556,7 @@ private struct LightshotToolbar: View {
             } else {
                 Menu {
                     ForEach([10, 12, 14, 18, 24, 32, 48], id: \.self) { s in
-                        Button("\(s)") { session.textSize = CGFloat(s) }
+                        Button("\(s)") { session.applyTextSize(CGFloat(s)) }
                     }
                 } label: {
                     HStack(spacing: 4) {
@@ -1210,7 +1578,7 @@ private struct LightshotToolbar: View {
             HStack(spacing: 4) {
                 ForEach(Self.colors.indices, id: \.self) { i in
                     let c = Self.colors[i]
-                    Button { session.color = c } label: {
+                    Button { session.applyColor(c) } label: {
                         RoundedRectangle(cornerRadius: 3)
                             .fill(Color(nsColor: c))
                             .frame(width: 16, height: 16)
@@ -1503,6 +1871,10 @@ struct AnnotationItem: Identifiable, Equatable {
     var stroke: [NSPoint] = []
     var text: String = ""
     var textSize: CGFloat = 18
+    /// Rich-text representation stored when the user edits inline with
+    /// mixed font sizes / colours. Takes priority over `text` + `textSize`
+    /// when drawing.
+    var attributedText: NSAttributedString?
 
     static func == (lhs: AnnotationItem, rhs: AnnotationItem) -> Bool { lhs.id == rhs.id }
 }
@@ -1531,6 +1903,11 @@ final class AnnotationSession: ObservableObject {
     /// initial drag, move, and resize). Used by the toolbar to display
     /// "696 × 382" style dimensions.
     @Published var selectionSize: CGSize = .zero
+
+    /// Weak reference to the inline text editor currently on the canvas.
+    /// The toolbar uses this to apply text size / colour changes to the
+    /// selected range in real time.
+    weak var activeTextEditor: NSTextView?
     /// Drives the upload UI in the toolbar.
     @Published var uploadStatus: UploadStatus = .idle
 
@@ -1539,6 +1916,39 @@ final class AnnotationSession: ObservableObject {
     func undo() {
         guard !items.isEmpty else { return }
         items.removeLast()
+    }
+
+    // MARK: Inline text helpers (called by toolbar)
+
+    /// Sets the session-wide text size **and** applies the new size to the
+    /// inline text editor's selected range (or future typed text if nothing
+    /// is selected). This is how the toolbar's size picker modifies live text.
+    func applyTextSize(_ size: CGFloat) {
+        textSize = size
+        guard let editor = activeTextEditor else { return }
+        let font = NSFont.systemFont(ofSize: size, weight: .semibold)
+        let sel = editor.selectedRange()
+        if sel.length > 0 {
+            editor.textStorage?.addAttribute(.font, value: font, range: sel)
+        }
+        var attrs = editor.typingAttributes
+        attrs[.font] = font
+        editor.typingAttributes = attrs
+    }
+
+    /// Sets the session-wide colour **and** applies it to the inline text
+    /// editor's selected range (or future typed text).
+    func applyColor(_ color: NSColor) {
+        self.color = color
+        guard let editor = activeTextEditor else { return }
+        let sel = editor.selectedRange()
+        if sel.length > 0 {
+            editor.textStorage?.addAttribute(.foregroundColor, value: color, range: sel)
+        }
+        var attrs = editor.typingAttributes
+        attrs[.foregroundColor] = color
+        editor.typingAttributes = attrs
+        editor.insertionPointColor = color
     }
 
     /// Renders the current image + annotations into a fresh NSImage.
@@ -1574,12 +1984,21 @@ final class AnnotationSession: ObservableObject {
             p.lineWidth = item.width
             p.stroke()
         case .text:
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: item.textSize, weight: .semibold),
-                .foregroundColor: item.color
-            ]
-            let s = NSAttributedString(string: item.text, attributes: attrs)
-            s.draw(at: item.rect.origin)
+            let attrStr: NSAttributedString
+            if let at = item.attributedText, at.length > 0 {
+                attrStr = at
+            } else if !item.text.isEmpty {
+                attrStr = NSAttributedString(string: item.text, attributes: [
+                    .font: NSFont.systemFont(ofSize: item.textSize, weight: .semibold),
+                    .foregroundColor: item.color
+                ])
+            } else { return }
+
+            // With the export CTM now using positive-Y scale (matching
+            // the on-screen identity CTM in orientation), direct
+            // `draw(at:)` produces upright glyphs in both contexts.
+            // No NSImage / CGImage intermediary required.
+            attrStr.draw(at: item.rect.origin)
         }
     }
 }
@@ -1699,7 +2118,7 @@ struct ScreenshotEditorView: View {
             if session.tool == .text {
                 Menu {
                     ForEach(Self.textSizes, id: \.self) { s in
-                        Button("\(Int(s))") { session.textSize = s }
+                        Button("\(Int(s))") { session.applyTextSize(s) }
                     }
                 } label: {
                     HStack(spacing: 6) {
@@ -1759,7 +2178,7 @@ struct ScreenshotEditorView: View {
 
     private func colorSwatch(_ c: NSColor) -> some View {
         let isActive = c == session.color
-        return Button { session.color = c } label: {
+        return Button { session.applyColor(c) } label: {
             RoundedRectangle(cornerRadius: 3)
                 .fill(Color(nsColor: c))
                 .frame(width: 16, height: 16)
@@ -1803,7 +2222,7 @@ struct ScreenshotEditorView: View {
 
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.png]
-        panel.nameFieldStringValue = "Forge-Screenshot.png"
+        panel.nameFieldStringValue = forgeScreenshotDefaultFileName()
         if panel.runModal() == .OK, let url = panel.url {
             try? data.write(to: url)
         }
@@ -1987,14 +2406,21 @@ struct AnnotationCanvasView: NSViewRepresentable {
     }
 }
 
-final class _CanvasNSView: NSView {
+final class _CanvasNSView: NSView, NSTextViewDelegate {
     var session: AnnotationSession? { didSet { needsDisplay = true } }
     private var currentItem: AnnotationItem?
+
+    // Inline text editing
+    private var activeTextView: NSTextView?
+    private var activeTextOrigin: NSPoint = .zero
 
     override var isFlipped: Bool { false }
     override var acceptsFirstResponder: Bool { true }
 
     override func mouseDown(with event: NSEvent) {
+        // Commit any active inline text editor first
+        if activeTextView != nil { commitActiveText() }
+
         guard let s = session, let tool = s.tool else { return }
         let p = convert(event.locationInWindow, from: nil)
         var item = AnnotationItem(tool: tool, color: s.color, width: s.width)
@@ -2004,13 +2430,7 @@ final class _CanvasNSView: NSView {
         case .brush:
             item.stroke = [p]
         case .text:
-            item.rect.origin = p
-            item.textSize = s.textSize
-            item.text = promptForText() ?? ""
-            if !item.text.isEmpty {
-                s.items.append(item)
-            }
-            needsDisplay = true
+            beginInlineText(at: p)
             return
         }
         currentItem = item
@@ -2022,11 +2442,6 @@ final class _CanvasNSView: NSView {
         switch item.tool {
         case .rectangle, .ellipse:
             let origin = item.rect.origin
-            item.rect = NSRect(
-                x: min(origin.x, p.x), y: min(origin.y, p.y),
-                width: abs(p.x - origin.x), height: abs(p.y - origin.y)
-            )
-            // origin tracks the initial anchor, so update only width/height & keep top-left
             item.rect.origin = origin
             item.rect.size = CGSize(width: p.x - origin.x, height: p.y - origin.y)
         case .brush:
@@ -2040,7 +2455,6 @@ final class _CanvasNSView: NSView {
 
     override func mouseUp(with event: NSEvent) {
         if let item = currentItem, let s = session {
-            // Normalize rect (handle dragging up/left)
             var finalItem = item
             if item.tool == .rectangle || item.tool == .ellipse {
                 finalItem.rect = NSRect(
@@ -2057,22 +2471,79 @@ final class _CanvasNSView: NSView {
         needsDisplay = true
     }
 
-    private func promptForText() -> String? {
-        let alert = NSAlert()
-        alert.messageText = "Add text"
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Add")
-        alert.addButton(withTitle: "Cancel")
-        let result = alert.runModal()
-        if result == .alertFirstButtonReturn { return field.stringValue }
-        return nil
+    // MARK: Inline text
+
+    private func beginInlineText(at point: NSPoint) {
+        commitActiveText()
+        guard let s = session else { return }
+        let font = NSFont.systemFont(ofSize: s.textSize, weight: .semibold)
+        let lineHeight = ceil(font.ascender - font.descender + font.leading) + 6
+        let width = max(120, bounds.width - point.x - 8)
+
+        let ts = NSTextStorage()
+        let lm = NSLayoutManager(); ts.addLayoutManager(lm)
+        let tc = NSTextContainer(size: NSSize(width: width, height: .greatestFiniteMagnitude))
+        tc.widthTracksTextView = true; tc.lineFragmentPadding = 0
+        lm.addTextContainer(tc)
+
+        let tv = NSTextView(frame: NSRect(x: point.x, y: point.y, width: width, height: lineHeight),
+                            textContainer: tc)
+        tv.isRichText = true; tv.allowsUndo = true
+        tv.drawsBackground = false; tv.focusRingType = .none
+        tv.isEditable = true; tv.isSelectable = true
+        tv.isVerticallyResizable = true; tv.isHorizontallyResizable = false
+        tv.textContainerInset = .zero; tv.font = font
+        tv.textColor = s.color; tv.insertionPointColor = s.color
+        tv.typingAttributes = [.font: font, .foregroundColor: s.color]
+        tv.delegate = self
+
+        addSubview(tv)
+        activeTextView = tv; activeTextOrigin = point
+        s.activeTextEditor = tv
+        DispatchQueue.main.async { [weak tv, weak self] in
+            guard let tv = tv, let win = self?.window else { return }
+            win.makeFirstResponder(tv)
+        }
+    }
+
+    private func commitActiveText() {
+        guard let tv = activeTextView, let s = session else { return }
+        if !tv.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            var item = AnnotationItem(tool: .text, color: s.color, width: s.width)
+            item.rect.origin = activeTextOrigin
+            item.text = tv.string; item.textSize = s.textSize
+            item.attributedText = NSAttributedString(attributedString: tv.attributedString())
+            s.items.append(item)
+        }
+        tv.removeFromSuperview(); activeTextView = nil
+        s.activeTextEditor = nil; window?.makeFirstResponder(self)
+        needsDisplay = true
+    }
+
+    private func cancelActiveText() {
+        guard let tv = activeTextView else { return }
+        tv.removeFromSuperview(); activeTextView = nil
+        session?.activeTextEditor = nil; window?.makeFirstResponder(self)
+        needsDisplay = true
+    }
+
+    func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(insertNewline(_:)) { commitActiveText(); return true }
+        if commandSelector == #selector(cancelOperation(_:)) { cancelActiveText(); return true }
+        return false
+    }
+
+    func textDidChange(_ notification: Notification) {
+        guard let tv = activeTextView, let lm = tv.layoutManager, let tc = tv.textContainer else { return }
+        lm.ensureLayout(for: tc)
+        var frame = tv.frame
+        frame.size.height = max(ceil(lm.usedRect(for: tc).height) + 4, 24)
+        tv.frame = frame
     }
 
     override func draw(_ dirtyRect: NSRect) {
         guard let s = session else { return }
 
-        // Image fit-to-bounds, preserve aspect
         let imgSize = s.baseImage.size
         let scale = min(bounds.width / imgSize.width, bounds.height / imgSize.height)
         let drawW = imgSize.width * scale
@@ -2084,8 +2555,6 @@ final class _CanvasNSView: NSView {
         )
         s.baseImage.draw(in: drawRect)
 
-        // Note: annotations drawn in canvas coordinates; in this MVP we
-        // overlay them directly without rescaling. (See follow-up TODO.)
         for item in s.items { AnnotationSession.draw(item: item, in: bounds) }
         if let c = currentItem { AnnotationSession.draw(item: c, in: bounds) }
     }

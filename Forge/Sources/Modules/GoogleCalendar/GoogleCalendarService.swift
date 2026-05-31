@@ -309,6 +309,9 @@ final class GoogleCalendarService: NSObject, ObservableObject {
         let attachments: [Attachment]?
         let reminders: Reminders?
         let status: String?
+        /// Google Calendar event type: "default", "outOfOffice",
+        /// "focusTime", "workingLocation", "birthday", etc.
+        let eventType: String?
 
         struct TimeRef: Decodable {
             let dateTime: String?   // ISO 8601 with TZ
@@ -429,7 +432,8 @@ final class GoogleCalendarService: NSObject, ObservableObject {
                 confirmedAttendeeCount: confirmed,
                 attachments: mappedAttachments,
                 attendees: mappedAttendees,
-                remindersMinutes: popupReminders
+                remindersMinutes: popupReminders,
+                eventType: eventType
             )
         }
 

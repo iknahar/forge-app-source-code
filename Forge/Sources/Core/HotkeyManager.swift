@@ -11,6 +11,11 @@ final class HotkeyManager {
         let id: String
         let eventHotKey: EventHotKeyRef
         let handler: () -> Void
+        /// Runs **synchronously** inside the Carbon event handler, before the
+        /// `DispatchQueue.main.async` dispatch. Use this for work that must
+        /// execute in the *current* runloop iteration — e.g. capturing the
+        /// screen before transient UI (popovers) auto-dismisses.
+        let syncPreAction: (() -> Void)?
     }
 
     // MARK: - Properties
@@ -38,6 +43,7 @@ final class HotkeyManager {
         keyCode: UInt16,
         modifiers: NSEvent.ModifierFlags,
         id: String,
+        syncPreAction: (() -> Void)? = nil,
         handler: @escaping () -> Void
     ) {
         let hotkeyId = nextId
@@ -72,7 +78,8 @@ final class HotkeyManager {
         hotkeys[hotkeyId] = RegisteredHotkey(
             id: id,
             eventHotKey: hotKey,
-            handler: handler
+            handler: handler,
+            syncPreAction: syncPreAction
         )
 
         print("[Forge] Registered hotkey: \(id)")
@@ -91,10 +98,11 @@ final class HotkeyManager {
         keyCode: UInt16,
         modifiers: NSEvent.ModifierFlags,
         id: String,
+        syncPreAction: (() -> Void)? = nil,
         handler: @escaping () -> Void
     ) {
         unregister(id: id)
-        register(keyCode: keyCode, modifiers: modifiers, id: id, handler: handler)
+        register(keyCode: keyCode, modifiers: modifiers, id: id, syncPreAction: syncPreAction, handler: handler)
     }
 
     func unregisterAll() {
@@ -130,6 +138,12 @@ final class HotkeyManager {
 
             let manager = Unmanaged<HotkeyManager>.fromOpaque(userData).takeUnretainedValue()
             if let registered = manager.hotkeys[hotKeyID.id] {
+                // Run syncPreAction NOW, in the current runloop iteration,
+                // before the async dispatch. This is critical for operations
+                // like screen capture that must happen before transient UI
+                // (e.g. NSPopover with .transient behavior) auto-dismisses
+                // on the next runloop cycle.
+                registered.syncPreAction?()
                 DispatchQueue.main.async {
                     registered.handler()
                 }

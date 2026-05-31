@@ -514,6 +514,11 @@ final class EyeCareModule: ForgeModule, ObservableObject {
         // breaks get their warning back.
         suppressPrebreakWarningOnce = false
         if !isLong { completedShortBreaks += 1 } else { completedShortBreaks = 0 }
+        // Gentle chime to announce the break — "Breeze" is calming,
+        // distinctly different from the meeting reminder's "Glass".
+        if let sound = NSSound(named: NSSound.Name("Breeze")) {
+            sound.play()
+        }
         presentBreakOverlay(totalSeconds: durationSeconds, isLong: isLong)
         NotificationCenter.default.post(name: .forgeEyeBreakStarted, object: self)
     }

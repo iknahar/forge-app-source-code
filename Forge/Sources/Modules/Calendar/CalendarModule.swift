@@ -32,7 +32,24 @@ final class CalendarModule: ForgeModule, ObservableObject {
     /// without an RSVP) keep `myResponseStatus == nil` and pass
     /// through unaffected.
     var activeEvents: [CalendarEvent] {
-        events.filter { $0.myResponseStatus != "declined" }
+        let nonDeclined = events.filter { $0.myResponseStatus != "declined" }
+
+        // Collect Out of Office blocks. Any non-OOO event whose time
+        // range overlaps with an OOO block is suppressed — the user
+        // has said "I'm away", so those meetings are irrelevant.
+        let oooBlocks = nonDeclined.filter { $0.eventType == "outOfOffice" }
+        guard !oooBlocks.isEmpty else { return nonDeclined }
+
+        return nonDeclined.filter { event in
+            // Keep OOO events themselves visible (so the user sees
+            // their OOO status in the calendar / menu bar).
+            if event.eventType == "outOfOffice" { return true }
+            // Drop any event that overlaps with an OOO block.
+            let dominated = oooBlocks.contains { ooo in
+                event.startDate < ooo.endDate && ooo.startDate < event.endDate
+            }
+            return !dominated
+        }
     }
 
     var nextEvent: CalendarEvent? {
@@ -240,13 +257,13 @@ final class CalendarModule: ForgeModule, ObservableObject {
         // Now that native-calendar changes are event-driven (via
         // .EKEventStoreChanged), this timer's only real job is to pull
         // fresh Google data over the network, which has no local change
-        // signal. 60s cadence with a generous tolerance lets macOS
-        // coalesce the wake-up with other timers to save power — calendar
-        // data is not second-sensitive.
-        let timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        // signal. 15s cadence keeps the menu bar snappy — edits made in
+        // Google Calendar (web or mobile) show up within seconds instead
+        // of waiting a full minute.
+        let timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             self?.loadEvents()
         }
-        timer.tolerance = 15
+        timer.tolerance = 3
         updateTimer = timer
     }
 
@@ -328,6 +345,12 @@ struct CalendarEvent: Identifiable {
     /// "accepted"). Used in the meeting reminder to show "👥 N".
     let confirmedAttendeeCount: Int
 
+    /// Google Calendar event type — "default", "outOfOffice",
+    /// "focusTime", "workingLocation", etc. Nil for EventKit events.
+    /// Used to detect Out of Office blocks and suppress other events
+    /// that overlap with them.
+    let eventType: String?
+
     struct GoogleRouting: Equatable {
         let accountEmail: String   // OAuth account that owns this calendar
         let calendarId: String     // e.g. "primary" or the calendar's email
@@ -370,6 +393,8 @@ struct CalendarEvent: Identifiable {
         // through Forge; we only round-trip Google events here.
         self.attendees = []
         self.remindersMinutes = []
+        // EventKit doesn't surface Google's eventType field.
+        self.eventType = nil
     }
 
     // Preview/mock initializer
@@ -390,7 +415,8 @@ struct CalendarEvent: Identifiable {
         confirmedAttendeeCount: Int = 0,
         attachments: [EventAttachment] = [],
         attendees: [EventAttendee] = [],
-        remindersMinutes: [Int] = []
+        remindersMinutes: [Int] = [],
+        eventType: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -409,7 +435,11 @@ struct CalendarEvent: Identifiable {
         self.attachments = attachments
         self.attendees = attendees
         self.remindersMinutes = remindersMinutes
+        self.eventType = eventType
     }
+
+    /// True when this is a Google Calendar "Out of Office" event.
+    var isOutOfOffice: Bool { eventType == "outOfOffice" }
 
     var hasMeetingLink: Bool { meetingURL != nil }
 

@@ -452,7 +452,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         registerHotkey("fancyZones", binding: b["fancyZones"]) { [weak self] in
             self?.moduleRegistry.module(ofType: FancyZonesModule.self)?.openEditor()
         }
-        registerHotkey("screenshot", binding: b["screenshot"]) { [weak self] in
+        registerHotkey("screenshot", binding: b["screenshot"], syncPreAction: { [weak self] in
+            // Capture the screen SYNCHRONOUSLY inside the Carbon event
+            // handler, before the DispatchQueue.main.async dispatch. This
+            // preserves transient UI (e.g. Forge menu-bar popover with
+            // `.transient` behavior) that auto-dismisses on the next
+            // runloop cycle. The captured image is stashed on the module
+            // for startCapture() to pick up.
+            guard let module = self?.moduleRegistry.module(ofType: ScreenshotAnnotateModule.self),
+                  let screen = NSScreen.main else { return }
+            module.hotkeyPreCapture = CGWindowListCreateImage(
+                screen.frame, .optionOnScreenOnly, kCGNullWindowID, [.bestResolution]
+            )
+        }) { [weak self] in
             self?.moduleRegistry.module(ofType: ScreenshotAnnotateModule.self)?.startCapture()
         }
         // Find My Mouse has no global hotkey — it's gesture-only
@@ -473,7 +485,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         }
     }
 
-    private func registerHotkey(_ id: String, binding: ShortcutBinding?, handler: @escaping () -> Void) {
+    private func registerHotkey(_ id: String, binding: ShortcutBinding?, syncPreAction: (() -> Void)? = nil, handler: @escaping () -> Void) {
         guard let binding = binding else { return }
         // Skip disabled actions — the user wants this action silenced
         // without removing its stored binding.
@@ -482,6 +494,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             keyCode: binding.keyCode,
             modifiers: binding.nsModifiers,
             id: id,
+            syncPreAction: syncPreAction,
             handler: handler
         )
     }
@@ -605,6 +618,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             // Ensure popover window is key
             popover.contentViewController?.view.window?.makeKey()
             print("[Forge] togglePopover: shown=\(popover.isShown)")
+
+            // Immediately fetch the latest calendar data so the user
+            // always sees fresh events the moment they open the popover
+            // — no waiting for the background 15s poll cycle.
+            moduleRegistry.module(ofType: CalendarModule.self)?.loadEvents()
         }
     }
 
@@ -721,8 +739,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         // Icon visibility — show hammer only if the user includes `.icon`.
         // Fallback: always show icon if no text tokens, otherwise the item disappears.
         let textTokens = tokens.filter { $0 != .icon }
+
+        // When both Ongoing and Next Event are active, each title
+        // competes for menu-bar space. Tighten the per-title limit
+        // so neither gets swallowed by the global 60-char clamp.
+        let titleBearingCount = textTokens.filter {
+            $0 == .ongoingMeeting || $0 == .nextEvent
+        }.count
+        let titleMax = titleBearingCount >= 2 ? 14 : 22
+
         let renderedParts = textTokens.compactMap { token -> String? in
-            let s = renderMenuBarToken(token)
+            let s = renderMenuBarToken(token, titleMax: titleMax)
             return s.isEmpty ? nil : s
         }
         var titleText = renderedParts.joined(separator: settingsManager.menuBarSeparator)
@@ -845,7 +872,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     /// Render a single token to its display string. Returns "" for tokens that
     /// have no current value (e.g. nextEvent when there are no upcoming events).
-    private func renderMenuBarToken(_ token: SettingsManager.MenuBarToken) -> String {
+    private func renderMenuBarToken(_ token: SettingsManager.MenuBarToken, titleMax: Int = 22) -> String {
         let cal = Calendar.current
         let now = Date()
         let fmt = DateFormatter()
@@ -879,7 +906,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                 let m = mins % 60
                 suffix = m > 0 ? "\(h)h \(m)m left" : "\(h)h left"
             }
-            return "● \(truncate(live.title, max: 20)) · \(suffix)"
+            return "● \(truncate(live.title, max: titleMax)) · \(suffix)"
 
         case .nextEvent:
             // Skip the ongoing event so combining both tokens doesn't
@@ -895,9 +922,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             else { return "" }
             let mins = Int(next.startDate.timeIntervalSince(now) / 60)
             if mins < 60 && mins >= 0 {
-                return "\(truncate(next.title, max: 22)) · \(mins)m"
+                return "\(truncate(next.title, max: titleMax)) · \(mins)m"
             }
-            return truncate(next.title, max: 22)
+            return truncate(next.title, max: titleMax)
 
         case .countdown:
             guard let next = moduleRegistry.module(ofType: CalendarModule.self)?.nextEvent

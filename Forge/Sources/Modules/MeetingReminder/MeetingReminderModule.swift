@@ -34,11 +34,12 @@ final class MeetingReminderModule: ForgeModule, ObservableObject {
     @Published private(set) var activeEvent: CalendarEvent?
     private var pollTimer: Timer?
     private var window: NSPanel?
-    /// Event IDs the user has already dismissed (banner closed via X,
-    /// dismiss button, or by joining the meeting). Persisted across
-    /// app restarts so a dismissed reminder doesn't pop up again next
-    /// launch — the user said "no" once, that's a real preference.
-    private var dismissed: Set<String> = []
+    /// Dismissed events: maps event ID → the event's `startDate` at the
+    /// moment the user dismissed. If the meeting is later rescheduled
+    /// (start time moves by more than 60 seconds), the dismissal no
+    /// longer matches and the reminder re-fires — so the user learns
+    /// about the new time instead of silently missing it.
+    private var dismissed: [String: Date] = [:]
     /// Per-event "shut up until this time" — the snooze flow stamps
     /// a future date here, the filter in `tick()` honors it. Also
     /// persisted so a 10-minute snooze survives a quick app restart.
@@ -76,7 +77,8 @@ final class MeetingReminderModule: ForgeModule, ObservableObject {
     /// notification (e.g. user clicked Join twice) is harmless.
     @objc private func handleMeetingJoinedNotification(_ note: Notification) {
         guard let eventId = note.userInfo?["eventId"] as? String else { return }
-        markDismissed(eventId)
+        let startDate = calendarRef?.events.first(where: { $0.id == eventId })?.startDate ?? Date()
+        markDismissed(eventId, startDate: startDate)
         if activeEvent?.id == eventId {
             hideBanner()
         }
@@ -125,7 +127,16 @@ final class MeetingReminderModule: ForgeModule, ObservableObject {
                     && now < event.endDate
                 return (upcoming || recentlyStarted) && now < event.endDate
             }
-            .filter { !dismissed.contains($0.id) }
+            .filter { event in
+                // If the event was never dismissed → eligible.
+                guard let dismissedStart = dismissed[event.id] else { return true }
+                // Legacy sentinel (.distantFuture) = old-format dismiss, always honored.
+                if dismissedStart == .distantFuture { return false }
+                // If the event was rescheduled (start time moved > 60s),
+                // void the old dismissal and re-trigger the reminder so
+                // the user learns about the new time.
+                return abs(dismissedStart.timeIntervalSince(event.startDate)) > 60
+            }
             .filter { (snoozedUntil[$0.id] ?? .distantPast) <= now }
             .sorted { $0.startDate < $1.startDate }
             .first
@@ -306,7 +317,7 @@ final class MeetingReminderModule: ForgeModule, ObservableObject {
     }
 
     private func handleDismiss(_ event: CalendarEvent) {
-        markDismissed(event.id)
+        markDismissed(event.id, startDate: event.startDate)
         hideBanner()
     }
 
@@ -340,10 +351,15 @@ final class MeetingReminderModule: ForgeModule, ObservableObject {
 
     // MARK: - Persistence
 
-    /// JSON shape on disk. Only two pieces of state — the dismissed
-    /// event-id set and the snooze-until map — so this stays small.
+    /// JSON shape on disk. Stores dismissed + snoozed state.
+    /// `dismissedEvents` maps event ID → start-time at dismissal;
+    /// `dismissedEventIds` is the legacy format (plain ID array,
+    /// pre-reschedule-aware). Both are optional for backward compat.
     private struct ReminderState: Codable {
-        var dismissedEventIds: [String]
+        /// Current format: eventId → startDate at time of dismissal.
+        var dismissedEvents: [String: Date]?
+        /// Legacy format (pre-1.0.3): plain event IDs with no time info.
+        var dismissedEventIds: [String]?
         var snoozedUntil: [String: Date]
     }
 
@@ -363,23 +379,35 @@ final class MeetingReminderModule: ForgeModule, ObservableObject {
             let data = try? Data(contentsOf: stateURL),
             let state = try? JSONDecoder().decode(ReminderState.self, from: data)
         else { return }
-        dismissed = Set(state.dismissedEventIds)
+
+        if let events = state.dismissedEvents {
+            // New format — eventId → startDate at dismissal.
+            dismissed = events
+        } else if let ids = state.dismissedEventIds {
+            // Legacy migration: use .distantFuture as a sentinel that
+            // means "old-style dismiss — always honored regardless of
+            // time changes". These entries will be pruned naturally by
+            // gcExpired() once their events end.
+            for id in ids { dismissed[id] = .distantFuture }
+        }
         snoozedUntil = state.snoozedUntil
     }
 
     private func persistState() {
         let state = ReminderState(
-            dismissedEventIds: Array(dismissed),
+            dismissedEvents: dismissed,
+            dismissedEventIds: nil,   // stop writing legacy format
             snoozedUntil: snoozedUntil
         )
         guard let data = try? JSONEncoder().encode(state) else { return }
         try? data.write(to: stateURL, options: .atomic)
     }
 
-    /// Mark an event dismissed AND persist. Use this everywhere we
-    /// touch the `dismissed` set so the on-disk record stays in sync.
-    private func markDismissed(_ eventId: String) {
-        dismissed.insert(eventId)
+    /// Mark an event dismissed at its current start time AND persist.
+    /// If the event is later rescheduled (start time changes by > 60s),
+    /// the dismissal won't match and the reminder will re-fire.
+    private func markDismissed(_ eventId: String, startDate: Date) {
+        dismissed[eventId] = startDate
         persistState()
     }
 
@@ -401,7 +429,7 @@ final class MeetingReminderModule: ForgeModule, ObservableObject {
         let byId = Dictionary(uniqueKeysWithValues: cal.events.map { ($0.id, $0) })
         let beforeCount = dismissed.count + snoozedUntil.count
 
-        dismissed = dismissed.filter { id in
+        dismissed = dismissed.filter { id, _ in
             guard let event = byId[id] else { return true }
             return event.endDate > now
         }
