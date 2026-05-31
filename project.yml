@@ -24,14 +24,24 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.toolkit.forge
         PRODUCT_NAME: Forge
-        MARKETING_VERSION: "1.0.4"
-        CURRENT_PROJECT_VERSION: 5
+        MARKETING_VERSION: "1.0.5"
+        CURRENT_PROJECT_VERSION: 6
         INFOPLIST_FILE: Forge/Resources/Info.plist
         CODE_SIGN_ENTITLEMENTS: Forge/Resources/Forge.entitlements
         LS_UI_ELEMENT: YES
         ARCHS: "$(ARCHS_STANDARD)"
-        ENABLE_HARDENED_RUNTIME: YES
-        CODE_SIGN_IDENTITY: "-"
+        # Stable self-signed identity ("Forge Dev", created in the login
+        # keychain) instead of ad-hoc "-". Ad-hoc regenerates the code
+        # signature on every rebuild, which invalidates Keychain "Always
+        # Allow" grants and TCC permissions (Accessibility, Screen
+        # Recording) each time. A fixed cert keeps the designated
+        # requirement constant, so those grants persist across rebuilds
+        # and across app upgrades. NOT for Gatekeeper on other Macs —
+        # that still needs Apple notarization.
+        ENABLE_HARDENED_RUNTIME: NO
+        CODE_SIGN_IDENTITY: "Forge Dev"
+        CODE_SIGN_STYLE: Manual
+        DEVELOPMENT_TEAM: ""
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         COMBINE_HIDPI_IMAGES: YES
         SWIFT_EMIT_LOC_STRINGS: YES

@@ -167,9 +167,38 @@ rm -rf build/dmg-staging
 
 ### For Personal Use (no Apple Developer account)
 
-The default config uses ad-hoc signing (`CODE_SIGN_IDENTITY="-"`). The app works on your own Mac but shows a Gatekeeper warning on other Macs.
+The build is signed with a **free, self-signed code-signing certificate** named
+`Forge Dev`. This is *not* ad-hoc (`-`): ad-hoc regenerates the signature on
+every rebuild, which invalidates Keychain "Always Allow" grants and TCC
+permissions (Accessibility, Screen Recording) each time — producing repeated
+authorization prompts and lost permissions. A fixed cert keeps the *designated
+requirement* constant, so those grants persist across rebuilds and app upgrades.
 
-To bypass on another Mac: right-click Forge.app → Open → "Open Anyway".
+The app still shows a Gatekeeper warning on **other** Macs (a self-signed cert
+isn't trusted by Apple — only notarization removes that). To bypass on another
+Mac: right-click Forge.app → Open → "Open Anyway", or
+`xattr -dr com.apple.quarantine /Applications/Forge.app`.
+
+**One-time setup — create the `Forge Dev` certificate:**
+
+Open **Keychain Access** → menu **Certificate Assistant → Create a Certificate…**
+
+| Field | Value |
+|---|---|
+| Name | `Forge Dev` |
+| Identity Type | Self Signed Root |
+| Certificate Type | Code Signing |
+| Let me override defaults | ✓ (set validity to e.g. 3650 days) |
+
+It lands in your **login** keychain. Verify with:
+
+```bash
+security find-identity -p codesigning | grep "Forge Dev"
+```
+
+If you don't have this cert (e.g. a fresh clone on another machine), either
+create it as above, or set `CODE_SIGN_IDENTITY: "-"` in `project.yml` to fall
+back to ad-hoc signing.
 
 ### For Distribution (Apple Developer account required)
 
