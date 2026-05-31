@@ -23,6 +23,8 @@ final class ColorPickerModule: ForgeModule, ObservableObject {
     private var loupeView: ColorLoupeView?
     private var eventMonitor: Any?
     private var mouseMoveMonitor: Any?
+    private var rightClickMonitor: Any?
+    private var scrollMonitor: Any?
 
     // MARK: - Lifecycle
 
@@ -90,13 +92,13 @@ final class ColorPickerModule: ForgeModule, ObservableObject {
         }
 
         // Track right-click to cancel
-        let rightClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.rightMouseDown]) { [weak self] _ in
+        rightClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.rightMouseDown]) { [weak self] _ in
             self?.stopPicking()
             return nil
         }
 
         // Track scroll to zoom
-        let scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel]) { [weak self] event in
+        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel]) { [weak self] event in
             self?.loupeView?.adjustZoom(delta: event.scrollingDeltaY)
             return nil
         }
@@ -113,6 +115,14 @@ final class ColorPickerModule: ForgeModule, ObservableObject {
         if let monitor = eventMonitor {
             NSEvent.removeMonitor(monitor)
             eventMonitor = nil
+        }
+        if let monitor = rightClickMonitor {
+            NSEvent.removeMonitor(monitor)
+            rightClickMonitor = nil
+        }
+        if let monitor = scrollMonitor {
+            NSEvent.removeMonitor(monitor)
+            scrollMonitor = nil
         }
 
         overlayWindow?.orderOut(nil)
@@ -136,12 +146,20 @@ final class ColorPickerModule: ForgeModule, ObservableObject {
         let formatted = formatColor(color, format: outputFormat)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(formatted, forType: .string)
-
         saveHistory()
-        stopPicking()
 
-        // Show toast
+        // Give the user a clear "it copied" beat: flash the loupe's info
+        // bar to a green "✓ Copied <value>" confirmation, play the system
+        // copy sound, then tear the overlay down after a short hold. The
+        // loupe freezes itself while the banner is up, so stray
+        // moves/clicks during the hold are ignored.
+        loupeView?.flashCopied(formatted)
+        NSSound(named: NSSound.Name("Pop"))?.play()
         print("[Forge ColorPicker] Picked: \(formatted)")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+            self?.stopPicking()
+        }
     }
 
     // MARK: - Color Formatting

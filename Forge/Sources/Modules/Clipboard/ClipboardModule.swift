@@ -99,9 +99,16 @@ final class ClipboardModule: ForgeModule, ObservableObject {
 
     private func startWatching() {
         pollTimer?.invalidate()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: true) { [weak self] _ in
+        // NSPasteboard offers no change notification, so polling is the
+        // only option — but reading `changeCount` is cheap and a ~1s
+        // latency on clipboard history is imperceptible. 1.0s with a
+        // 0.3s tolerance roughly halves the wake-ups vs the old 0.6s and
+        // lets macOS coalesce the timer with other system timers.
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.captureIfChanged()
         }
+        timer.tolerance = 0.3
+        pollTimer = timer
         // Capture once on startup so the panel isn't empty on first open
         // when the user already has something on their pasteboard.
         captureIfChanged()
@@ -289,8 +296,16 @@ final class ClipboardModule: ForgeModule, ObservableObject {
             }
             return entry
         }
-        guard let data = try? JSONEncoder().encode(toPersist) else { return }
-        UserDefaults.standard.set(data, forKey: defaultsKey)
+        // The `toPersist` snapshot is built on the main thread (it reads
+        // the @Published `entries`), but the encode + UserDefaults write
+        // is pure I/O — push it off-main so a clipboard capture never
+        // causes a main-thread hitch. Clipboard history can carry image
+        // blobs, so the encode is not always trivial.
+        let key = defaultsKey
+        DispatchQueue.global(qos: .utility).async {
+            guard let data = try? JSONEncoder().encode(toPersist) else { return }
+            UserDefaults.standard.set(data, forKey: key)
+        }
     }
 
     private func loadHistory() {

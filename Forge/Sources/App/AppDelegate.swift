@@ -163,6 +163,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Flush any debounced settings write synchronously so a change
+        // made in the last fraction of a second before quit survives.
+        settingsManager.flushPendingSave()
         moduleRegistry.deactivateAllModules()
         hotkeyManager.unregisterAll()
         if let monitor = eventMonitor {
@@ -696,10 +699,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     private func startMenuBarRefreshTimer() {
         menuBarRefreshTimer?.invalidate()
-        // Refresh every 30s so countdowns and clocks stay current.
-        menuBarRefreshTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+        // Refresh every 30s so countdowns and clocks stay current. This
+        // timer runs for the whole life of the app, so the 10s tolerance
+        // matters: it lets macOS batch this wake-up with other timers
+        // (coalesced timers = fewer CPU wake-ups = better battery and a
+        // calmer system). Menu-bar countdowns aren't second-precise, so
+        // the slack is invisible.
+        let timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.refreshMenuBar()
         }
+        timer.tolerance = 10
+        menuBarRefreshTimer = timer
     }
 
     /// Recompute and apply the menu bar icon + title from `settings.menuBarTokens`.

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import QuartzCore
 
 /// Mouse Highlight — visual enhancements for the mouse cursor.
 /// Features: Find My Mouse (double-tap RIGHT Command for spotlight),
@@ -66,7 +67,11 @@ final class MouseHighlightModule: ForgeModule, ObservableObject {
     // Windows
     private var spotlightWindow: NSWindow?
     private var crosshairWindow: NSWindow?
-    private var spotlightAnimationTimer: Timer?
+    /// Drives the spotlight ripple. A CADisplayLink (not a Timer) so the
+    /// ripple advances exactly once per display refresh — vsync-locked,
+    /// judder-free, and automatically correct on 60Hz, 120Hz ProMotion,
+    /// and external displays alike.
+    private var spotlightDisplayLink: CADisplayLink?
     private var spotlightEscMonitorGlobal: Any?
     private var spotlightEscMonitorLocal: Any?
     private var spotlightAutoDismiss: DispatchWorkItem?
@@ -251,15 +256,15 @@ final class MouseHighlightModule: ForgeModule, ObservableObject {
             return event   // pass the event along so other handlers still fire
         }
 
-        // Drive the animated red ripple effect at ~30 fps
-        spotlightAnimationTimer?.invalidate()
-        spotlightAnimationTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-            guard
-                let view = self?.spotlightWindow?.contentView as? SpotlightView
-            else { return }
-            view.phase = (view.phase + 0.025).truncatingRemainder(dividingBy: 1)
-            view.needsDisplay = true
-        }
+        // Drive the animated red ripple with a display-synced CADisplayLink.
+        // The previous 1/30s Timer free-ran on the run loop, unaligned with
+        // the compositor — producing visible judder and rendering frames
+        // that were sometimes never shown. CADisplayLink fires in lockstep
+        // with the screen the spotlight window lives on.
+        spotlightDisplayLink?.invalidate()
+        let link = spotlightView.displayLink(target: self, selector: #selector(stepSpotlightRipple(_:)))
+        link.add(to: .main, forMode: .common)
+        spotlightDisplayLink = link
 
         // ESC dismisses — both global (outside Forge) and local (inside Forge)
         // are needed because each only covers one focus state.
@@ -284,6 +289,23 @@ final class MouseHighlightModule: ForgeModule, ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: dismiss)
     }
 
+    /// CADisplayLink callback — advances the ripple phase once per screen
+    /// refresh. The phase delta is derived from the real frame duration
+    /// (`targetTimestamp − timestamp`) so the ripple travels at the same
+    /// visual speed (~0.75 cycles/sec, matching the old 0.025-per-1/30s
+    /// Timer) regardless of whether the display runs at 60Hz or 120Hz.
+    @objc private func stepSpotlightRipple(_ link: CADisplayLink) {
+        guard let view = spotlightWindow?.contentView as? SpotlightView else {
+            link.invalidate()
+            spotlightDisplayLink = nil
+            return
+        }
+        let frameDuration = max(0, link.targetTimestamp - link.timestamp)
+        view.phase = (view.phase + CGFloat(frameDuration) * 0.75)
+            .truncatingRemainder(dividingBy: 1)
+        view.needsDisplay = true
+    }
+
     /// Public entry point for other modules (e.g. Screenshot) that need to
     /// guarantee no spotlight ring is visible before they do their own thing.
     func dismissSpotlightImmediately() {
@@ -295,8 +317,8 @@ final class MouseHighlightModule: ForgeModule, ObservableObject {
         spotlightWindow?.orderOut(nil)
         spotlightWindow = nil
 
-        spotlightAnimationTimer?.invalidate()
-        spotlightAnimationTimer = nil
+        spotlightDisplayLink?.invalidate()
+        spotlightDisplayLink = nil
 
         // Cancel pending auto-dismiss if we're hiding early (e.g. from Esc).
         spotlightAutoDismiss?.cancel()
@@ -356,34 +378,16 @@ final class MouseHighlightModule: ForgeModule, ObservableObject {
     }
 
     private func animateClickRing(view: ClickRingView, window: NSWindow) {
-        var progress: CGFloat = 0
-        // 1s total — the disc snaps in, holds at full opacity for the
-        // bulk of the second, then fades out. Matches the alpha curve
-        // in `ClickRingView.draw(_:)` (5% fade-in / 80% hold / 15%
-        // fade-out → ≈ 50ms / 800ms / 150ms at this duration).
-        let duration: TimeInterval = 1.0
-        let startTime = CACurrentMediaTime()
-
-        let displayLink = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self, weak view, weak window] timer in
-            guard let view = view, let window = window else {
-                timer.invalidate()
-                return
-            }
-
-            let elapsed = CACurrentMediaTime() - startTime
-            progress = CGFloat(elapsed / duration)
-
-            if progress >= 1.0 {
-                timer.invalidate()
-                window.orderOut(nil)
-                self?.clickWindows.removeAll { $0 === window }
-                return
-            }
-
-            view.progress = progress
-            view.needsDisplay = true
+        // The ring drives its own CADisplayLink (vsync-locked, like the
+        // spotlight). When the 1s animation completes it calls back here
+        // so we can tear down the overlay window. Each ring animates
+        // independently, so rapid clicks each get a clean ripple.
+        view.onComplete = { [weak self, weak window] in
+            guard let window = window else { return }
+            window.orderOut(nil)
+            self?.clickWindows.removeAll { $0 === window }
         }
-        RunLoop.current.add(displayLink, forMode: .common)
+        view.startAnimating()
     }
 
     private func clearClickRings() {
@@ -561,6 +565,38 @@ final class ClickRingView: NSView {
     var ringColor: NSColor = .systemYellow
     var maxRadius: CGFloat = 10
     var progress: CGFloat = 0 // 0 to 1 across the full animation
+
+    /// Called once when the 1s ripple finishes, so the owner can tear
+    /// down the overlay window.
+    var onComplete: (() -> Void)?
+
+    private var rippleLink: CADisplayLink?
+    private var animationStart: CFTimeInterval = 0
+    private let animationDuration: CFTimeInterval = 1.0
+
+    /// Begin the ripple, driven by a display-synced CADisplayLink rather
+    /// than a free-running Timer. Progress is computed from wall-clock
+    /// elapsed time, so the animation lasts exactly 1s no matter the
+    /// refresh rate; the link just decides when to repaint.
+    func startAnimating() {
+        animationStart = CACurrentMediaTime()
+        let link = self.displayLink(target: self, selector: #selector(step(_:)))
+        link.add(to: .main, forMode: .common)
+        rippleLink = link
+    }
+
+    @objc private func step(_ link: CADisplayLink) {
+        let elapsed = CACurrentMediaTime() - animationStart
+        if elapsed >= animationDuration {
+            progress = 1
+            link.invalidate()
+            rippleLink = nil
+            onComplete?()
+            return
+        }
+        progress = CGFloat(elapsed / animationDuration)
+        needsDisplay = true
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         guard let context = NSGraphicsContext.current?.cgContext else { return }

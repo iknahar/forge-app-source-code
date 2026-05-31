@@ -94,11 +94,37 @@ final class CalendarModule: ForgeModule, ObservableObject {
     func activate() {
         requestCalendarAccess()
         startUpdateTimer()
+        // Event-driven refresh: macOS posts `.EKEventStoreChanged`
+        // whenever the underlying calendar database mutates (an edit in
+        // Calendar.app, a new invite syncing in via iCloud/Exchange).
+        // Observing it means native-calendar changes appear instantly
+        // instead of waiting up to a full poll interval. The timer below
+        // is now only really needed for the Google network path (which
+        // has no local change notification).
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(eventStoreChanged),
+            name: .EKEventStoreChanged,
+            object: eventStore
+        )
     }
 
     func deactivate() {
         updateTimer?.invalidate()
         updateTimer = nil
+        NotificationCenter.default.removeObserver(
+            self, name: .EKEventStoreChanged, object: eventStore
+        )
+    }
+
+    @objc private func eventStoreChanged() {
+        // Coalesce: the system can fire this several times in a burst
+        // during a sync. The reload itself is now off-main + cheap to
+        // re-enter, but hop to main first since we touch @Published state.
+        DispatchQueue.main.async { [weak self] in
+            self?.loadCalendars()
+            self?.loadEvents()
+        }
     }
 
     // MARK: - Calendar Access
@@ -146,37 +172,51 @@ final class CalendarModule: ForgeModule, ObservableObject {
             calendars: calendars.filter { !hiddenCalendarIds.contains($0.calendarIdentifier) }
         )
 
-        let ekRaw = eventStore.events(matching: predicate)
-        let ekEvents = ekRaw.map { CalendarEvent(from: $0) }
+        // `events(matching:)` walks the calendar database and can take
+        // 100–500ms on a busy account — far too long for the main
+        // thread, where it would stall the popover/menu every refresh.
+        // Run the query AND the EKEvent→CalendarEvent mapping on a
+        // background queue so every EKEvent property read happens off
+        // the same thread that fetched them (EKEvent is not thread-safe;
+        // we never let one cross threads — only the value-type
+        // CalendarEvent results and the extracted id Set do).
+        let store = eventStore
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let ekRaw = store.events(matching: predicate)
+            let ekEvents = ekRaw.map { CalendarEvent(from: $0) }
+            let ekExternalIds = Set(ekRaw.compactMap { $0.calendarItemExternalIdentifier })
 
-        // Show EventKit events immediately, then merge in native Google events
-        // when they arrive (dedupe by iCalUID — Google events that are ALSO in
-        // macOS Calendar would otherwise show twice).
-        self.events = ekEvents
-
-        Task { [weak self] in
-            let google = await GoogleCalendarService.shared.fetchAllEvents(
-                from: startDate, to: endDate
-            )
-            await MainActor.run {
+            DispatchQueue.main.async {
                 guard let self = self else { return }
-                // Build a set of EKEvent external identifiers (iCalUIDs) to dedupe.
-                let ekExternalIds = Set(ekRaw.compactMap { $0.calendarItemExternalIdentifier })
-                let uniqueGoogle = google.filter { event in
-                    // event.id is "google:<eventId>" — strip prefix for matching
-                    // Google's `iCalUID` equals EKEvent.calendarItemExternalIdentifier
-                    // when the same account is also wired through macOS Calendar.
-                    !ekExternalIds.contains(String(event.id.dropFirst("google:".count)))
-                }
-                self.events = ekEvents + uniqueGoogle
+                // Show EventKit events immediately, then merge in native
+                // Google events when they arrive (dedupe by iCalUID —
+                // Google events also present in macOS Calendar would
+                // otherwise show twice).
+                self.events = ekEvents
 
-                // Rebuild the contacts directory from the merged event
-                // list — used by the attendee autocomplete in the
-                // event editor. Cheap: in-memory dedupe on email.
-                let myEmails = Set(
-                    GoogleCalendarService.shared.accounts.map(\.email)
-                )
-                ContactsDirectory.shared.rebuild(from: self.events, myEmails: myEmails)
+                Task { [weak self] in
+                    let google = await GoogleCalendarService.shared.fetchAllEvents(
+                        from: startDate, to: endDate
+                    )
+                    await MainActor.run {
+                        guard let self = self else { return }
+                        let uniqueGoogle = google.filter { event in
+                            // event.id is "google:<eventId>"; Google's iCalUID
+                            // equals EKEvent.calendarItemExternalIdentifier when
+                            // the same account is also wired through macOS Calendar.
+                            !ekExternalIds.contains(String(event.id.dropFirst("google:".count)))
+                        }
+                        self.events = ekEvents + uniqueGoogle
+
+                        // Rebuild the contacts directory from the merged
+                        // event list — used by attendee autocomplete in
+                        // the event editor. Cheap: in-memory dedupe on email.
+                        let myEmails = Set(
+                            GoogleCalendarService.shared.accounts.map(\.email)
+                        )
+                        ContactsDirectory.shared.rebuild(from: self.events, myEmails: myEmails)
+                    }
+                }
             }
         }
     }
@@ -197,9 +237,17 @@ final class CalendarModule: ForgeModule, ObservableObject {
     // MARK: - Timer
 
     private func startUpdateTimer() {
-        updateTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        // Now that native-calendar changes are event-driven (via
+        // .EKEventStoreChanged), this timer's only real job is to pull
+        // fresh Google data over the network, which has no local change
+        // signal. 60s cadence with a generous tolerance lets macOS
+        // coalesce the wake-up with other timers to save power — calendar
+        // data is not second-sensitive.
+        let timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.loadEvents()
         }
+        timer.tolerance = 15
+        updateTimer = timer
     }
 
     // MARK: - Module Protocol

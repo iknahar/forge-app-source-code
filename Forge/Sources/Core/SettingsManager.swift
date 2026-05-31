@@ -221,6 +221,25 @@ final class SettingsManager: ObservableObject {
         return forgeDir.appendingPathComponent("settings.json")
     }()
 
+    /// True only while `load()` is bulk-assigning persisted values into
+    /// the `@Published` properties. Each property's `didSet` calls
+    /// `save()`, so without this guard a single launch would fire ~25
+    /// disk writes (one per restored property). The guard collapses
+    /// that to zero writes during load.
+    private var isLoading = false
+
+    /// Off-main serial queue for the JSON encode + atomic file write.
+    /// Persistence is I/O — there's no reason for it to ever touch the
+    /// main thread and stall UI.
+    private let persistQueue = DispatchQueue(
+        label: "com.toolkit.forge.settings-persist", qos: .utility
+    )
+
+    /// Pending debounced save. A slider drag or a burst of toggles
+    /// fires `save()` dozens of times in a few hundred ms; we coalesce
+    /// them into ONE write shortly after the user stops.
+    private var pendingSave: DispatchWorkItem?
+
     init() {
         load()
     }
@@ -229,6 +248,10 @@ final class SettingsManager: ObservableObject {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
         guard let data = try? Data(contentsOf: fileURL) else { return }
         guard let decoded = try? JSONDecoder().decode(PersistedSettings.self, from: data) else { return }
+
+        // Suppress per-property saves while we restore the whole struct.
+        isLoading = true
+        defer { isLoading = false }
 
         self.moduleStates = decoded.moduleStates
         self.use24HourTime = decoded.use24HourTime
@@ -282,8 +305,44 @@ final class SettingsManager: ObservableObject {
         if let v = decoded.reminderBackgroundImagePath { self.reminderBackgroundImagePath = v }
     }
 
+    /// Debounced, off-main persistence. Called from every property's
+    /// `didSet`. Collapses bursts of changes (slider drags, multi-toggle
+    /// settings sessions) into a single background write ~0.3s after the
+    /// last change. Skipped entirely during `load()`.
     private func save() {
-        let settings = PersistedSettings(
+        guard !isLoading else { return }
+        pendingSave?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.persistNow() }
+        pendingSave = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    /// Snapshot the (main-actor) settings into a value-type struct, then
+    /// hand the encode + atomic write to the utility queue. The snapshot
+    /// must happen on the main thread because it reads `@Published`
+    /// state; the encode/write is pure I/O and runs off-main.
+    private func persistNow() {
+        let settings = currentSnapshot()
+        let url = fileURL
+        persistQueue.async {
+            guard let data = try? JSONEncoder().encode(settings) else { return }
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    /// Force any pending debounced write to disk *synchronously*. Called
+    /// from `applicationWillTerminate` so a change made in the last 0.3s
+    /// before quit isn't lost.
+    func flushPendingSave() {
+        pendingSave?.cancel()
+        pendingSave = nil
+        let settings = currentSnapshot()
+        guard let data = try? JSONEncoder().encode(settings) else { return }
+        try? data.write(to: fileURL, options: .atomic)
+    }
+
+    private func currentSnapshot() -> PersistedSettings {
+        PersistedSettings(
             moduleStates: moduleStates,
             use24HourTime: use24HourTime,
             theme: theme,
@@ -311,9 +370,6 @@ final class SettingsManager: ObservableObject {
             reminderBackgroundImagePath: reminderBackgroundImagePath,
             actionEnabled: actionEnabled
         )
-
-        guard let data = try? JSONEncoder().encode(settings) else { return }
-        try? data.write(to: fileURL, options: .atomic)
     }
 }
 

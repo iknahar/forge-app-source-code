@@ -23,6 +23,19 @@ private func CGSMainConnectionID() -> Int32
 @_silgen_name("CGSSetWindowLevel")
 private func CGSSetWindowLevel(_ cid: Int32, _ wid: CGWindowID, _ level: Int32) -> Int32
 
+// Returns the connection ID that OWNS a given window. Setting a window's
+// level through its owning connection works on macOS versions where the
+// same call through our main connection is silently ignored.
+@_silgen_name("CGSGetWindowOwner")
+private func CGSGetWindowOwner(_ cid: Int32, _ wid: CGWindowID, _ outOwner: UnsafeMutablePointer<Int32>) -> Int32
+
+// Orders a window relative to another (or absolutely). order: 1 = above,
+// -1 = below, 0 = out. relativeTo: 0 = absolute front/back. Re-asserting
+// the order each tick complements the level change.
+@_silgen_name("CGSOrderWindow")
+private func CGSOrderWindow(_ cid: Int32, _ wid: CGWindowID, _ order: Int32, _ relativeTo: CGWindowID) -> Int32
+
+
 /// Pin Window module — keeps the focused window always-on-top with a
 /// thin red border, toggled by a global shortcut. FancyZones (zone
 /// tiling) lives in its own module now, so this one is scoped purely
@@ -50,11 +63,12 @@ final class WindowManagerModule: ForgeModule, ObservableObject {
     private var borderPanel: PinnedWindowBorderPanel?
 
     /// 60ms poll keeps the overlay glued to the window during drags /
-    /// resizes and continually calls `AXRaise` so the window stays
-    /// above other apps. AX has no "always on top" attribute for
-    /// third-party windows on macOS, so polling raise is the
-    /// industry-standard approach (used by Magnet, Rectangle Pro, etc.).
+    /// resizes and continually re-raises the window so it stays on top.
     private var pinTimer: Timer?
+
+    /// Watches for app-switch events so we can re-raise the pinned
+    /// window when the user clicks into another app.
+    private var appSwitchObserver: Any?
 
     struct PinnedTarget {
         let pid: pid_t
@@ -63,11 +77,9 @@ final class WindowManagerModule: ForgeModule, ObservableObject {
         let appName: String
     }
 
-    /// Window level we elevate pinned windows to. `kCGFloatingWindowLevel`
-    /// (3) sits above all normal app windows but below status-bar items
-    /// and Forge's own overlays. Picked deliberately so a system alert
-    /// can still display on top if one fires.
-    private let pinnedLevel = Int32(CGWindowLevelForKey(.floatingWindow))
+    /// Target window level. CGSSetWindowLevel may silently no-op on
+    /// macOS Tahoe with self-signed apps, so this is best-effort.
+    private let pinnedLevel: Int32 = 25   // kCGStatusWindowLevel
     private let normalLevel = Int32(CGWindowLevelForKey(.normalWindow))
 
     // MARK: - Lifecycle
@@ -166,47 +178,136 @@ final class WindowManagerModule: ForgeModule, ObservableObject {
 
     // MARK: - Pin Window
 
-    /// Toggle pin on the currently focused window. If something is
-    /// already pinned, unpins it (regardless of which window is
-    /// currently focused) — the shortcut is a global "release the
-    /// current pin" too.
+    /// Smart 3-state toggle:
+    ///  • Nothing pinned → pin the focused window
+    ///  • Pinned but behind other windows → bring it to front
+    ///  • Pinned AND already in front → unpin
     func togglePinWindow() {
-        if pinnedTarget != nil {
-            unpinWindow(playSound: true)
+        if let target = pinnedTarget {
+            let pinnedAppIsFront = NSWorkspace.shared.frontmostApplication?
+                .processIdentifier == target.pid
+            if pinnedAppIsFront {
+                unpinWindow(playSound: true)
+            } else {
+                bringPinnedToFront()
+            }
         } else {
             pinFocusedWindow()
         }
     }
 
+    /// Immediately bring the pinned window back to the front.
+    /// Called by the shortcut toggle and the app-switch observer.
+    private func bringPinnedToFront() {
+        guard let target = pinnedTarget else { return }
+        // Activate the app so its windows come to the foreground
+        NSRunningApplication(processIdentifier: target.pid)?
+            .activate(options: .activateIgnoringOtherApps)
+        // Raise the specific pinned window above siblings
+        AXUIElementPerformAction(
+            target.windowElement, kAXRaiseAction as CFString)
+        // Best-effort SkyLight elevation (works on older macOS,
+        // silently no-ops on Tahoe with self-signed apps)
+        elevate(windowID: target.windowID)
+    }
+
+    /// Best-effort SkyLight elevation. Tries to set the window level
+    /// via the private CGSSetWindowLevel API. On macOS Tahoe with
+    /// self-signed apps this silently no-ops — that's OK, the
+    /// app-switch observer handles the fallback. On older macOS (or
+    /// with a Developer ID signature) the level change sticks and the
+    /// window truly floats above everything.
+    private func elevate(windowID: CGWindowID) {
+        guard windowID != 0 else { return }
+        let mainConn = CGSMainConnectionID()
+        CGSSetWindowLevel(mainConn, windowID, pinnedLevel)
+        CGSOrderWindow(mainConn, windowID, 1, 0)
+
+        var ownerConn: Int32 = 0
+        if CGSGetWindowOwner(mainConn, windowID, &ownerConn) == 0,
+           ownerConn != 0 {
+            CGSSetWindowLevel(ownerConn, windowID, pinnedLevel)
+            CGSOrderWindow(ownerConn, windowID, 1, 0)
+        }
+    }
+
+    /// Resolve an AX window element to its CGWindowID. Fast path is the
+    /// private `_AXUIElementGetWindow`; if that returns 0 (it can, in
+    /// sandboxed/edge cases) we fall back to matching the window in the
+    /// CG window list by owner-pid + frame, which only needs the public
+    /// `CGWindowListCopyWindowInfo` metadata (no Screen Recording grant).
+    private func resolveWindowID(for element: AXUIElement, pid: pid_t) -> CGWindowID {
+        var wid: CGWindowID = 0
+        if _AXUIElementGetWindow(element, &wid) == .success, wid != 0 {
+            return wid
+        }
+
+        // Fallback — read the AX frame and match it against the on-screen
+        // windows owned by this pid.
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &posRef)
+        AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef)
+        var pos = CGPoint.zero
+        var size = CGSize.zero
+        if let p = posRef { AXValueGetValue(p as! AXValue, .cgPoint, &pos) }
+        if let s = sizeRef { AXValueGetValue(s as! AXValue, .cgSize, &size) }
+
+        guard let infoList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+        ) as? [[String: Any]] else { return 0 }
+
+        var bestMatch: CGWindowID = 0
+        for info in infoList {
+            guard
+                let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t, ownerPID == pid,
+                let num = info[kCGWindowNumber as String] as? CGWindowID,
+                let bounds = info[kCGWindowBounds as String] as? [String: CGFloat]
+            else { continue }
+            let bx = bounds["X"] ?? -1
+            let by = bounds["Y"] ?? -1
+            let bw = bounds["Width"] ?? -1
+            let bh = bounds["Height"] ?? -1
+            // CG window bounds and AX frame both use top-left global
+            // coordinates; match with a few-px tolerance.
+            if size.width > 0,
+               abs(bx - pos.x) < 6, abs(by - pos.y) < 6,
+               abs(bw - size.width) < 6, abs(bh - size.height) < 6 {
+                return num
+            }
+            // Keep the largest pid-owned window as a last resort if no
+            // exact frame match is found.
+            if bestMatch == 0, bw * bh > 0 { bestMatch = num }
+        }
+        return bestMatch
+    }
+
     /// Capture the focused window of the frontmost app and start
     /// holding it on top. Shows a red border + plays a pin sound.
+    /// Uses a dual strategy: SkyLight level elevation (best-effort,
+    /// may silently fail on macOS Tahoe with self-signed apps) plus
+    /// an app-switch observer that re-raises the window whenever
+    /// another app comes to the foreground.
     private func pinFocusedWindow() {
         guard let frontApp = NSWorkspace.shared.frontmostApplication else { return }
         let appRef = AXUIElementCreateApplication(frontApp.processIdentifier)
 
-        // `kAXFocusedWindowAttribute` is the right read: `kAXWindowsAttribute`
-        // returns ALL windows of the app, ordered arbitrarily — picking
-        // .first there would pin the wrong window when the app has
-        // multiple open.
         var windowRef: CFTypeRef?
         let err = AXUIElementCopyAttributeValue(
             appRef, kAXFocusedWindowAttribute as CFString, &windowRef
         )
         guard err == .success, let window = windowRef else {
-            // No focused window — likely the user is on the desktop, or
-            // Accessibility permission isn't granted. Soft-fail silently;
-            // System Settings → Privacy & Security → Accessibility shows
-            // the missing entitlement.
             NSSound.beep()
             return
         }
         let windowElement = window as! AXUIElement
+        let windowID = resolveWindowID(
+            for: windowElement, pid: frontApp.processIdentifier)
 
-        // Resolve the window's CGWindowID — needed by SkyLight to set
-        // the level cross-app. If we can't, fail soft (border + AXRaise
-        // still kick in but the pin won't elevate over other apps).
-        var windowID: CGWindowID = 0
-        _AXUIElementGetWindow(windowElement, &windowID)
+        guard windowID != 0 else {
+            NSSound.beep()
+            return
+        }
 
         pinnedTarget = PinnedTarget(
             pid: frontApp.processIdentifier,
@@ -215,24 +316,44 @@ final class WindowManagerModule: ForgeModule, ObservableObject {
             appName: frontApp.localizedName ?? "Window"
         )
 
-        // Elevate the window above other apps via SkyLight.
-        if windowID != 0 {
-            let conn = CGSMainConnectionID()
-            _ = CGSSetWindowLevel(conn, windowID, pinnedLevel)
-        }
+        // Best-effort SkyLight elevation
+        elevate(windowID: windowID)
 
         // Build the red-border overlay.
         let panel = PinnedWindowBorderPanel()
         panel.orderFront(nil)
         borderPanel = panel
 
+        // ── App-switch observer ────────────────────────────────────
+        // When the user clicks into another app, we wait a brief
+        // moment (so macOS finishes its activation animation), then
+        // re-activate the pinned app to push its window back on top.
+        appSwitchObserver = NSWorkspace.shared.notificationCenter
+            .addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification,
+                object: nil, queue: .main
+            ) { [weak self] notif in
+                guard let self = self, let target = self.pinnedTarget else { return }
+                guard let activated = notif.userInfo?[NSWorkspace.applicationUserInfoKey]
+                        as? NSRunningApplication else { return }
+                // Don't fight ourselves or the pinned app
+                if activated.processIdentifier == target.pid { return }
+                if activated.bundleIdentifier == Bundle.main.bundleIdentifier { return }
+
+                // Brief delay lets macOS finish its activation
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    [weak self] in
+                    self?.bringPinnedToFront()
+                }
+            }
+
         // Start the raise + reposition poller.
         pinTimer?.invalidate()
-        pinTimer = Timer.scheduledTimer(withTimeInterval: 0.06, repeats: true) { [weak self] _ in
+        pinTimer = Timer.scheduledTimer(
+            withTimeInterval: 0.06, repeats: true
+        ) { [weak self] _ in
             self?.tickPin()
         }
-        // Run one tick immediately so the border appears in place
-        // without a 60ms flash at (0, 0).
         tickPin()
 
         playPinSound(pin: true)
@@ -246,8 +367,13 @@ final class WindowManagerModule: ForgeModule, ObservableObject {
         borderPanel?.orderOut(nil)
         borderPanel = nil
 
-        // Restore the window's normal level so it stops floating after
-        // we release it. If the app already quit, this is a no-op.
+        // Remove app-switch observer
+        if let obs = appSwitchObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+            appSwitchObserver = nil
+        }
+
+        // Restore the window's normal level (best-effort)
         if let target = pinnedTarget, target.windowID != 0 {
             let conn = CGSMainConnectionID()
             _ = CGSSetWindowLevel(conn, target.windowID, normalLevel)
@@ -321,15 +447,10 @@ final class WindowManagerModule: ForgeModule, ObservableObject {
             panel.setFrame(expanded, display: false)
         }
 
-        // Persistent raise — keeps the window above OTHER windows in
-        // the same app (AXRaise) AND above other apps (SkyLight level
-        // re-application — macOS resets levels on space switches and
-        // some app activations).
+        // AXRaise keeps the pinned window above OTHER windows in the
+        // same app. Cross-app elevation is handled by the app-switch
+        // observer (or SkyLight if the level change took effect).
         AXUIElementPerformAction(target.windowElement, kAXRaiseAction as CFString)
-        if target.windowID != 0 {
-            let conn = CGSMainConnectionID()
-            _ = CGSSetWindowLevel(conn, target.windowID, pinnedLevel)
-        }
     }
 
     /// Submarine on pin (distinct "tug" sound), Pop on unpin (release).

@@ -391,9 +391,15 @@ final class EyeCareModule: ForgeModule, ObservableObject {
 
     private func startTickTimer() {
         tickTimer?.invalidate()
-        tickTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        // 1s tick drives the break countdown. A 0.2s tolerance still
+        // reads as a smooth per-second countdown but lets macOS coalesce
+        // the wake-up — worthwhile since this runs continuously while
+        // Eye Care is enabled.
+        let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             self?.tick()
         }
+        timer.tolerance = 0.2
+        tickTimer = timer
     }
 
     private func tick() {

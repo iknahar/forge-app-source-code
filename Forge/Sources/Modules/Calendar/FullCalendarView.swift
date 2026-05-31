@@ -46,8 +46,8 @@ struct FullCalendarView: View {
         .preferredColorScheme(settings.theme.colorScheme)
         .onAppear {
             anchorDate = startOfWeek(for: Date())
-            startTimer()
         }
+        .onReceive(currentTimePublisher) { now = $0 }
         .animation(.easeOut(duration: 0.2), value: selectedEvent?.id)
         .sheet(item: $newEventSlot) { slot in
             // Quick natural-language create. The full editor is still
@@ -469,11 +469,16 @@ struct FullCalendarView: View {
 
     // MARK: - Timer for current-time line
 
-    private func startTimer() {
-        Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in
-            self.now = Date()
-        }
-    }
+    /// Nudges the "current time" indicator every 30s. `autoconnect()`
+    /// ties the subscription to this view's lifetime — it starts when
+    /// the view subscribes and, crucially, STOPS when the view
+    /// disappears. The previous `startTimer()` created a bare repeating
+    /// `Timer` that was never invalidated and captured `self`, so every
+    /// appearance leaked another timer that ran for the rest of the app's
+    /// life. The 5s tolerance lets macOS coalesce the wake-up.
+    private let currentTimePublisher = Timer
+        .publish(every: 30, tolerance: 5, on: .main, in: .common)
+        .autoconnect()
 }
 
 // MARK: - Event Block

@@ -86,9 +86,15 @@ final class MeetingReminderModule: ForgeModule, ObservableObject {
 
     private func startPolling() {
         pollTimer?.invalidate()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+        // 15s cadence with 3s tolerance. This poll runs 24/7, so giving
+        // macOS slack to coalesce it with other timers is a meaningful
+        // power win; reminder lead times are minute-granular, so a few
+        // seconds of jitter on the poll is immaterial.
+        let timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             self?.tick()
         }
+        timer.tolerance = 3
+        pollTimer = timer
         // Immediate check on activation
         tick()
     }
