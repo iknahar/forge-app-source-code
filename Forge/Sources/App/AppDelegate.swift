@@ -309,6 +309,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             controller.sizingOptions = []
         }
         popover.contentViewController = controller
+        applyPopoverAppearance()
+    }
+
+    /// Pins the popover's `NSAppearance` to the user's theme choice.
+    ///
+    /// WHY: `ForgeTheme.Colors` are appearance-adaptive — each one is an
+    /// `NSColor(dynamicProvider:)` that resolves by checking whether the
+    /// *current NSAppearance* is darkAqua. A status-bar `NSPopover` whose
+    /// `appearance` is left nil inherits an unstable appearance from the
+    /// menu-bar context, so those colors flip light/dark between opens
+    /// (the "jumping" bug) regardless of the chosen theme.
+    ///
+    /// Pinning a concrete appearance makes the colors resolve consistently
+    /// and keeps them in agreement with SwiftUI's `preferredColorScheme`.
+    /// Called again at each show so a live theme change — or a macOS
+    /// "Auto" appearance switch at sunset — is reflected on the next open.
+    private func applyPopoverAppearance() {
+        guard let popover = popover else { return }
+        switch settingsManager.theme {
+        case .light:
+            popover.appearance = NSAppearance(named: .aqua)
+        case .dark:
+            popover.appearance = NSAppearance(named: .darkAqua)
+        case .system:
+            // Pin to the app's CURRENT effective appearance (resolved to a
+            // concrete aqua/darkAqua). Leaving it nil is what lets the
+            // popover inherit the status bar's appearance and flip.
+            let match = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) ?? .aqua
+            popover.appearance = NSAppearance(named: match)
+        }
     }
 
     // MARK: - Module Registration
@@ -612,6 +642,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             popover.performClose(nil)
         } else {
             print("[Forge] togglePopover: showing popover, contentSize=\(popover.contentSize)")
+            // Re-pin appearance so a theme change in Settings (or a system
+            // Auto-appearance switch) is honored on this open instead of
+            // flipping to an inherited status-bar appearance.
+            applyPopoverAppearance()
             // Position popover below menu bar button
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
 
