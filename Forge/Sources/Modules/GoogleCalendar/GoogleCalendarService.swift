@@ -984,22 +984,26 @@ final class GoogleCalendarService: NSObject, ObservableObject {
             )
 
             await MainActor.run {
-                // If we're reconnecting an existing account, keep its color
+                // Pick the color: keep existing if reconnecting, or
+                // auto-assign the next unused preset for new accounts
+                // (the user can change it later from the account row).
+                let colorHex: String
                 if let existing = accounts.first(where: { $0.email == user.email }) {
-                    finalizePendingAccount(email: user.email,
-                                           name: user.name,
-                                           colorHex: existing.colorHex)
+                    colorHex = existing.colorHex
                 } else {
-                    let suggested = CalendarColorPreset
+                    colorHex = CalendarColorPreset
                         .nextUnused(in: linkedCalendarColors())
                         .hex
-                    pendingAccount = PendingGoogleAccount(
-                        email: user.email,
-                        name: user.name,
-                        suggestedColor: suggested
-                    )
                 }
+                finalizePendingAccount(email: user.email,
+                                       name: user.name,
+                                       colorHex: colorHex)
                 lastError = nil
+
+                // Bring Forge to the front so the user sees the
+                // connected account in Settings, not the leftover
+                // Chrome tab.
+                NSApp.activate(ignoringOtherApps: true)
             }
         } catch let e as GoogleAuthError {
             await MainActor.run { lastError = e.localizedDescription }

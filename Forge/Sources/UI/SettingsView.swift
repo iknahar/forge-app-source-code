@@ -2168,8 +2168,6 @@ private struct MenuBarSeparatorEditor: View {
 
 private struct GoogleAccountsEditor: View {
     @ObservedObject private var service = GoogleCalendarService.shared
-    @State private var showAdvanced = false
-    @State private var clientIDDraft: String = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -2219,58 +2217,13 @@ private struct GoogleAccountsEditor: View {
                 .foregroundColor(.orange)
             }
 
-            // Advanced disclosure — most users never open this
-            DisclosureGroup(isExpanded: $showAdvanced) {
-                advancedClientIDEditor
-                    .padding(.top, 8)
-            } label: {
-                Text("Advanced")
-                    .font(.system(size: 10, weight: .semibold))
-                    .tracking(0.5)
-                    .foregroundColor(.secondary)
-            }
-
-            Text("Native Google events flow into the calendar live. Pick a color when you connect — every event from that account uses it.")
+            Text("Native Google events flow into the calendar live. A color is auto-assigned when you connect — tap the dot next to an account to change it.")
                 .font(.system(size: 10))
                 .foregroundColor(.secondary)
                 .padding(.top, 4)
         }
-        // Color picker sheet — appears after a successful OAuth handshake.
-        .sheet(item: $service.pendingAccount) { pending in
-            GoogleColorPickerSheet(pending: pending)
-        }
     }
 
-    private var advancedClientIDEditor: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("OAuth Client ID")
-                .font(.system(size: 10, weight: .semibold))
-                .tracking(0.5)
-                .foregroundColor(.secondary)
-            Text("Override the bundled Forge client ID with your own Google Cloud OAuth client (Desktop app type). Leave blank to use the default.")
-                .font(.system(size: 10))
-                .foregroundColor(.secondary)
-
-            HStack(spacing: 6) {
-                TextField(GoogleCalendarService.defaultClientID,
-                          text: $clientIDDraft)
-                    .font(.system(size: 11, design: .monospaced))
-                    .textFieldStyle(.roundedBorder)
-                    .onAppear {
-                        clientIDDraft = service.hasCustomClientID ? service.clientID : ""
-                    }
-                Button("Save") {
-                    service.clientID = clientIDDraft.trimmingCharacters(in: .whitespaces)
-                }
-                if service.hasCustomClientID {
-                    Button("Reset") {
-                        service.clientID = ""
-                        clientIDDraft = ""
-                    }
-                }
-            }
-        }
-    }
 }
 
 // MARK: Google account row + color picker
@@ -2356,92 +2309,6 @@ private struct GoogleColorPalettePopover: View {
         }
         .padding(14)
         .frame(width: 280)
-    }
-}
-
-private struct GoogleColorPickerSheet: View {
-    let pending: PendingGoogleAccount
-    @ObservedObject private var service = GoogleCalendarService.shared
-    @State private var selection: String
-
-    init(pending: PendingGoogleAccount) {
-        self.pending = pending
-        _selection = State(initialValue: pending.suggestedColor)
-    }
-
-    var body: some View {
-        VStack(spacing: 18) {
-            HStack(spacing: 12) {
-                ZStack {
-                    Circle()
-                        .fill(Color(hex: selection))
-                        .frame(width: 44, height: 44)
-                    Image(systemName: "g.circle.fill")
-                        .font(.system(size: 22, weight: .semibold))
-                        .foregroundColor(.white)
-                }
-                VStack(alignment: .leading, spacing: 2) {
-                    if let name = pending.name {
-                        Text(name).font(.system(size: 14, weight: .semibold))
-                    }
-                    Text(pending.email)
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary)
-                }
-                Spacer()
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Pick a color for this account")
-                    .font(.system(size: 10, weight: .semibold))
-                    .tracking(0.5)
-                    .foregroundColor(.secondary)
-                    .textCase(.uppercase)
-                Text("Every event from \(pending.email) will use this color across Forge.")
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-
-                HStack(spacing: 8) {
-                    ForEach(CalendarColorPreset.allCases) { preset in
-                        Button { selection = preset.hex } label: {
-                            ZStack {
-                                Circle().fill(Color(hex: preset.hex))
-                                    .frame(width: 26, height: 26)
-                                if selection.uppercased() == preset.hex.uppercased() {
-                                    Image(systemName: "checkmark")
-                                        .font(.system(size: 11, weight: .bold))
-                                        .foregroundColor(.white)
-                                }
-                            }
-                            .overlay(Circle().stroke(Color.black.opacity(0.08), lineWidth: 0.5))
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(.top, 4)
-            }
-
-            HStack {
-                Button("Cancel") {
-                    service.cancelPendingAccount()
-                }
-                .keyboardShortcut(.cancelAction)
-                Spacer()
-                Button {
-                    service.confirmPendingAccount(color: selection)
-                } label: {
-                    Text("Connect")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 16).padding(.vertical, 6)
-                        .background(Capsule().fill(ForgeTheme.Colors.accent))
-                }
-                .buttonStyle(.plain)
-                .keyboardShortcut(.defaultAction)
-            }
-        }
-        .padding(20)
-        .frame(width: 420)
     }
 }
 
