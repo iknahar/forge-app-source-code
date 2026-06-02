@@ -1353,8 +1353,8 @@ private struct MiniCalendarPreview: View {
         let now = Date()
         let cal = Calendar.current
         let year = cal.component(.year, from: now)
-        let start = cal.date(from: DateComponents(year: year, month: 1, day: 1))!
-        let next  = cal.date(from: DateComponents(year: year + 1, month: 1, day: 1))!
+        let start = cal.date(from: DateComponents(year: year, month: 1, day: 1)) ?? now
+        let next  = cal.date(from: DateComponents(year: year + 1, month: 1, day: 1)) ?? now
         return now.timeIntervalSince(start) / next.timeIntervalSince(start)
     }
     private var dayProgress: Double {

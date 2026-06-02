@@ -270,7 +270,7 @@ struct CalendarView: View {
                 calendarModule.selectedDate = calendar.date(
                     byAdding: .month, value: delta,
                     to: calendarModule.selectedDate
-                )!
+                ) ?? calendarModule.selectedDate
                 calendarModule.loadEvents()
             }
         } label: {
@@ -813,7 +813,7 @@ struct CalendarView: View {
     // MARK: - Helpers
 
     private func generateMonthDays() -> [Date] {
-        let monthStart = calendar.date(from: calendar.dateComponents([.year, .month], from: calendarModule.selectedDate))!
+        let monthStart = calendar.date(from: calendar.dateComponents([.year, .month], from: calendarModule.selectedDate)) ?? calendarModule.selectedDate
 
         // weekday: Sun=1 ... Sat=7
         let weekday = calendar.component(.weekday, from: monthStart)
@@ -825,7 +825,7 @@ struct CalendarView: View {
             leading = (weekday - 1) % 7   // Sun=0, Mon=1, …, Sat=6
         }
 
-        let startDate = calendar.date(byAdding: .day, value: -leading, to: monthStart)!
+        let startDate = calendar.date(byAdding: .day, value: -leading, to: monthStart) ?? monthStart
 
         return (0..<42).compactMap { offset in
             calendar.date(byAdding: .day, value: offset, to: startDate)
@@ -870,7 +870,7 @@ struct CalendarView: View {
     private var timeLeftInDayString: String {
         let cal = Calendar.current
         let now = Date()
-        let endOfDay = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: now))!
+        let endOfDay = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: now)) ?? now
         let seconds = endOfDay.timeIntervalSince(now)
         let hours = Int(seconds / 3600)
         let mins = Int((seconds.truncatingRemainder(dividingBy: 3600)) / 60)

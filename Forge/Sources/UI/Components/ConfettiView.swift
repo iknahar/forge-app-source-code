@@ -102,8 +102,8 @@ struct ConfettiBurst: View {
             let distance = CGFloat.random(in: 80...220)
             let gravity = CGFloat.random(in: 30...120)
             return ConfettiParticle(
-                color: colors.randomElement()!,
-                shape: shapes.randomElement()!,
+                color: colors.randomElement() ?? .white,
+                shape: shapes.randomElement() ?? .circle,
                 size: CGFloat.random(in: 5...10),
                 endX: cos(angle) * distance,
                 endY: sin(angle) * distance + gravity,

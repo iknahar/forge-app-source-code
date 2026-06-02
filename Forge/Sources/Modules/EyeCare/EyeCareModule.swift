@@ -207,8 +207,8 @@ final class EyeCareModule: ForgeModule, ObservableObject {
     private var wakeObservers: [NSObjectProtocol] = []
 
     private let configURL: URL = {
-        let support = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let support = (FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support"))
             .appendingPathComponent("Forge", isDirectory: true)
         try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
         return support.appendingPathComponent("eye_care.json")
@@ -243,8 +243,8 @@ final class EyeCareModule: ForgeModule, ObservableObject {
 
     // Static so init can read it before `self` is available.
     private static let configURL: URL = {
-        let support = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let support = (FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support"))
             .appendingPathComponent("Forge", isDirectory: true)
         try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
         return support.appendingPathComponent("eye_care.json")

@@ -203,7 +203,12 @@ final class GoogleCalendarService: NSObject, ObservableObject {
         }
 
         // Build Google auth URL with the loopback redirect URI
-        var comps = URLComponents(string: authorizeURL)!
+        guard var comps = URLComponents(string: authorizeURL) else {
+            lastError = "Failed to build OAuth URL"
+            server.stop()
+            loopback = nil
+            return
+        }
         comps.queryItems = [
             URLQueryItem(name: "client_id", value: id),
             URLQueryItem(name: "redirect_uri", value: currentRedirectURI),
@@ -477,8 +482,10 @@ final class GoogleCalendarService: NSObject, ObservableObject {
                             to end: Date) async throws -> [EventDTO] {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
-        var comps = URLComponents(string:
-            "https://www.googleapis.com/calendar/v3/calendars/\(calendarId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? calendarId)/events")!
+        guard var comps = URLComponents(string:
+            "https://www.googleapis.com/calendar/v3/calendars/\(calendarId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? calendarId)/events") else {
+            throw GoogleAuthError.network("Invalid events URL for calendar \(calendarId)")
+        }
         comps.queryItems = [
             URLQueryItem(name: "timeMin", value: f.string(from: start)),
             URLQueryItem(name: "timeMax", value: f.string(from: end)),
@@ -486,7 +493,10 @@ final class GoogleCalendarService: NSObject, ObservableObject {
             URLQueryItem(name: "orderBy", value: "startTime"),
             URLQueryItem(name: "maxResults", value: "250"),
         ]
-        var req = URLRequest(url: comps.url!)
+        guard let url = comps.url else {
+            throw GoogleAuthError.network("Invalid events URL for calendar \(calendarId)")
+        }
+        var req = URLRequest(url: url)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let (data, resp) = try await URLSession.shared.data(for: req)
         try Self.assertOK(resp, data: data)
@@ -767,7 +777,10 @@ final class GoogleCalendarService: NSObject, ObservableObject {
         //    sync regardless).
         var patchURL = getURL.absoluteString
         patchURL += "?sendUpdates=externalOnly"
-        var patchReq = URLRequest(url: URL(string: patchURL)!)
+        guard let patchURLValue = URL(string: patchURL) else {
+            throw GoogleAuthError.network("Invalid RSVP PATCH URL for event \(eventId)")
+        }
+        var patchReq = URLRequest(url: patchURLValue)
         patchReq.httpMethod = "PATCH"
         patchReq.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         patchReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -823,7 +836,11 @@ final class GoogleCalendarService: NSObject, ObservableObject {
             ("supportsAttachments", supportsAttachments ? "true" : nil),
             ("sendUpdates", sendUpdates),
         ])
-        return URL(string: s)!
+        if let url = URL(string: s) { return url }
+        // Fallback: the calendar id produced a string URL(string:) couldn't
+        // parse. The unencoded `primary` collection is always valid; the
+        // request will fail server-side rather than crash the app.
+        return URL(string: "https://www.googleapis.com/calendar/v3/calendars/primary/events")!
     }
 
     private static func eventResourceURL(
@@ -845,7 +862,11 @@ final class GoogleCalendarService: NSObject, ObservableObject {
             ("supportsAttachments", supportsAttachments ? "true" : nil),
             ("sendUpdates", sendUpdates),
         ])
-        return URL(string: s)!
+        if let url = URL(string: s) { return url }
+        // Fallback: malformed event/calendar id. Return a structurally valid
+        // resource URL so the request fails server-side instead of crashing.
+        return URL(string: "https://www.googleapis.com/calendar/v3/calendars/primary/events/\(encId)")
+            ?? URL(string: "https://www.googleapis.com/calendar/v3/calendars/primary/events")!
     }
 
     private static func eventBody(title: String,
@@ -1077,7 +1098,10 @@ final class GoogleCalendarService: NSObject, ObservableObject {
     }
 
     private func fetchUserInfo(accessToken: String) async throws -> UserInfo {
-        var req = URLRequest(url: URL(string: userinfoURL)!)
+        guard let url = URL(string: userinfoURL) else {
+            throw GoogleAuthError.userInfo("Invalid userinfo URL")
+        }
+        var req = URLRequest(url: url)
         req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         let (data, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
@@ -1087,15 +1111,23 @@ final class GoogleCalendarService: NSObject, ObservableObject {
     }
 
     private func revoke(token: String) async throws {
-        var comps = URLComponents(string: revokeURL)!
+        guard var comps = URLComponents(string: revokeURL) else {
+            throw GoogleAuthError.network("Invalid revoke URL")
+        }
         comps.queryItems = [URLQueryItem(name: "token", value: token)]
-        var req = URLRequest(url: comps.url!)
+        guard let url = comps.url else {
+            throw GoogleAuthError.network("Invalid revoke URL")
+        }
+        var req = URLRequest(url: url)
         req.httpMethod = "POST"
         _ = try await URLSession.shared.data(for: req)
     }
 
     private func postForm(url: String, params: [String: String]) async throws -> TokenResponse {
-        var req = URLRequest(url: URL(string: url)!)
+        guard let requestURL = URL(string: url) else {
+            throw GoogleAuthError.tokenExchange("Invalid token endpoint URL")
+        }
+        var req = URLRequest(url: requestURL)
         req.httpMethod = "POST"
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         let body = params

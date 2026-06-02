@@ -1779,7 +1779,7 @@ struct NewEventSheet: View {
 
         // All-day events: end = start + 1 day (Google expects exclusive end).
         let end = isAllDay
-            ? Calendar.current.date(byAdding: .day, value: 1, to: startDate)!
+            ? (Calendar.current.date(byAdding: .day, value: 1, to: startDate) ?? startDate)
             : startDate.addingTimeInterval(TimeInterval(duration * 60))
         let attendeeEmails = attendees.map(\.email)
 

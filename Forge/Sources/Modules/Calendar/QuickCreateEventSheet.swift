@@ -923,7 +923,7 @@ enum NaturalLanguageEventParser {
         // Quick keywords first
         if let r = lower.range(of: "tomorrow") {
             let stripped = removeRange(r, from: text, lower: lower)
-            return (cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: now))!, stripped)
+            return (cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: now)) ?? now, stripped)
         }
         if let r = lower.range(of: "today") {
             let stripped = removeRange(r, from: text, lower: lower)

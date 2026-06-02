@@ -574,9 +574,9 @@ final class CustomLayoutBuilderView: NSView {
     @discardableResult
     private func mergeAcross(resizer: Resizer) -> Bool {
         let touching = Set(resizer.topOrLeftZones + resizer.bottomOrRightZones)
-        guard !touching.isEmpty else { return false }
+        guard let firstIndex = touching.first, zones.indices.contains(firstIndex) else { return false }
 
-        var unionRect: CGRect = zones[touching.first!].rect
+        var unionRect: CGRect = zones[firstIndex].rect
         for i in touching { unionRect = unionRect.union(zones[i].rect) }
 
         let totalArea = touching.reduce(CGFloat(0)) {

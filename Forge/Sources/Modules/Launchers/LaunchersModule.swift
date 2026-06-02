@@ -96,8 +96,8 @@ final class LaunchersModule: ForgeModule, ObservableObject {
     // MARK: - Persistence path
 
     private let storeURL: URL = {
-        let support = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let support = (FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support"))
             .appendingPathComponent("Forge", isDirectory: true)
         try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
         return support.appendingPathComponent("launchers.json")
@@ -108,8 +108,8 @@ final class LaunchersModule: ForgeModule, ObservableObject {
     }
 
     private static let storeURL: URL = {
-        let support = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let support = (FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support"))
             .appendingPathComponent("Forge", isDirectory: true)
         try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
         return support.appendingPathComponent("launchers.json")

@@ -176,12 +176,12 @@ final class CalendarModule: ForgeModule, ObservableObject {
 
     func loadEvents() {
         let calendar = Calendar.current
-        let startOfMonth = calendar.date(from: calendar.dateComponents([.year, .month], from: selectedDate))!
-        let endOfMonth = calendar.date(byAdding: .month, value: 1, to: startOfMonth)!
+        let startOfMonth = calendar.date(from: calendar.dateComponents([.year, .month], from: selectedDate)) ?? selectedDate
+        let endOfMonth = calendar.date(byAdding: .month, value: 1, to: startOfMonth) ?? startOfMonth
 
         // Extend range to include adjacent months for grid display
-        let startDate = calendar.date(byAdding: .weekOfYear, value: -1, to: startOfMonth)!
-        let endDate = calendar.date(byAdding: .weekOfYear, value: 1, to: endOfMonth)!
+        let startDate = calendar.date(byAdding: .weekOfYear, value: -1, to: startOfMonth) ?? startOfMonth
+        let endDate = calendar.date(byAdding: .weekOfYear, value: 1, to: endOfMonth) ?? endOfMonth
 
         let predicate = eventStore.predicateForEvents(
             withStart: startDate,

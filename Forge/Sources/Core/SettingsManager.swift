@@ -215,7 +215,7 @@ final class SettingsManager: ObservableObject {
     // MARK: - Persistence
 
     private let fileURL: URL = {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
         let forgeDir = appSupport.appendingPathComponent("Forge", isDirectory: true)
         try? FileManager.default.createDirectory(at: forgeDir, withIntermediateDirectories: true)
         return forgeDir.appendingPathComponent("settings.json")

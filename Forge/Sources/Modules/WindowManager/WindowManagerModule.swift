@@ -250,6 +250,9 @@ final class WindowManagerModule: ForgeModule, ObservableObject {
         AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef)
         var pos = CGPoint.zero
         var size = CGSize.zero
+        // AXValue is a CoreFoundation type; the downcast is statically
+        // guaranteed to succeed, so `as!` here can't crash (`as?` won't even
+        // compile). The optional-binding on the ref already handles a nil.
         if let p = posRef { AXValueGetValue(p as! AXValue, .cgPoint, &pos) }
         if let s = sizeRef { AXValueGetValue(s as! AXValue, .cgSize, &size) }
 
@@ -546,7 +549,7 @@ final class WindowManagerModule: ForgeModule, ObservableObject {
     // MARK: - Persistence
 
     private var workspacesURL: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
         return appSupport.appendingPathComponent("Forge/workspaces.json")
     }
 
