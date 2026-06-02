@@ -26,7 +26,7 @@ final class SettingsManager: ObservableObject {
     /// This pair is what users expect on a fresh install — "what am
     /// I in right now, and what's next" — and matches the marketing
     /// page promise of "your day in your menu bar."
-    @Published var menuBarTokens: [MenuBarToken] = [.icon, .ongoingMeeting, .nextEvent] {
+    @Published var menuBarTokens: [MenuBarToken] = [.icon, .ongoingMeeting, .nextEvent, .countdown] {
         didSet { save() }
     }
 
