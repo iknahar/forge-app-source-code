@@ -149,6 +149,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         startMenuBarRefreshTimer()
         refreshMenuBar()
 
+        // Launch-at-login is ON by default: register Forge as a login item
+        // unless the user has explicitly turned it off. Also self-heals the
+        // registered path if the app moved (dev build → /Applications).
+        LaunchAtLogin.applyDefaultPolicy()
+
         // Open Settings on launch so opening Forge from the
         // Applications folder / Launchpad / Spotlight lands the
         // user on a real window instead of just dropping a menu

@@ -41,12 +41,40 @@ enum MeetingLauncher {
     /// we don't have an event context (e.g. deep-link handlers).
     static func join(_ event: CalendarEvent) {
         guard let url = event.meetingURL else { return }
-        open(url)
+        // For Google Meet links, pin the Google account that owns the
+        // event so the browser opens it under that account instead of
+        // defaulting to whichever Google account is signed in first.
+        open(accountScopedURL(url, accountEmail: event.googleRouting?.accountEmail))
         NotificationCenter.default.post(
             name: .meetingJoined,
             object: nil,
             userInfo: ["eventId": event.id]
         )
+    }
+
+    /// Appends `authuser=<email>` to a Google Meet URL so the browser
+    /// opens the meeting under the account that owns the event.
+    ///
+    /// Without this, a `meet.google.com/...` link opened in a browser
+    /// with multiple signed-in Google accounts defaults to `authuser=0`
+    /// (the first account), which is often NOT the account invited to the
+    /// meeting — leading to a "you need access" wall. Google honors an
+    /// `authuser` value that's either an index or an email address; we
+    /// use the email since it's stable regardless of sign-in order.
+    ///
+    /// No-op for non-Meet URLs, a missing/!email account, or when an
+    /// `authuser` parameter is already present on the link.
+    static func accountScopedURL(_ url: URL, accountEmail: String?) -> URL {
+        guard let email = accountEmail, email.contains("@"),
+              (url.host?.lowercased().contains("meet.google.com") ?? false),
+              var comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        else { return url }
+
+        var items = comps.queryItems ?? []
+        guard !items.contains(where: { $0.name.lowercased() == "authuser" }) else { return url }
+        items.append(URLQueryItem(name: "authuser", value: email))
+        comps.queryItems = items
+        return comps.url ?? url
     }
 
     /// Returns a service tag suitable for showing next to the Join

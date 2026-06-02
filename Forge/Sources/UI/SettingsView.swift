@@ -302,13 +302,7 @@ struct SettingsView: View {
                         title: "Launch at login",
                         description: "Forge starts automatically when you sign in."
                     ) {
-                        Toggle("", isOn: Binding(
-                            get: { LaunchAtLogin.isEnabled },
-                            set: { LaunchAtLogin.setEnabled($0) }
-                        ))
-                            .toggleStyle(.forge)
-                            .labelsHidden()
-                            .tint(ForgeTheme.Colors.accent)
+                        LaunchAtLoginToggle()
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -3142,5 +3136,28 @@ private extension NSColor {
         let g = CGFloat((int >> 8) & 0xFF) / 255
         let b = CGFloat(int & 0xFF) / 255
         self.init(srgbRed: r, green: g, blue: b, alpha: 1)
+    }
+}
+
+// MARK: - Launch at login toggle
+
+/// Settings toggle for launch-at-login, backed by `@State` initialized
+/// from the live `SMAppService` status and reconciled after each change.
+/// It always reflects reality — including snapping back if macOS defers a
+/// request to `.requiresApproval` — which makes the control a dependable
+/// two-way toggle instead of a write-only switch.
+private struct LaunchAtLoginToggle: View {
+    @State private var enabled = LaunchAtLogin.isEnabled
+
+    var body: some View {
+        Toggle("", isOn: $enabled)
+            .toggleStyle(.forge)
+            .labelsHidden()
+            .tint(ForgeTheme.Colors.accent)
+            .onChange(of: enabled) { _, newValue in
+                let actual = LaunchAtLogin.setEnabled(newValue)
+                if actual != newValue { enabled = actual }
+            }
+            .onAppear { enabled = LaunchAtLogin.isEnabled }
     }
 }

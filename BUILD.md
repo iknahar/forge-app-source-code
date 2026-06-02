@@ -167,38 +167,22 @@ rm -rf build/dmg-staging
 
 ### For Personal Use (no Apple Developer account)
 
-The build is signed with a **free, self-signed code-signing certificate** named
-`Forge Dev`. This is *not* ad-hoc (`-`): ad-hoc regenerates the signature on
-every rebuild, which invalidates Keychain "Always Allow" grants and TCC
-permissions (Accessibility, Screen Recording) each time — producing repeated
-authorization prompts and lost permissions. A fixed cert keeps the *designated
-requirement* constant, so those grants persist across rebuilds and app upgrades.
+Distributed builds use **ad-hoc signing** (`CODE_SIGN_IDENTITY = "-"`). The app
+works on any Mac after a one-time Gatekeeper bypass and shows a warning on Macs
+other than the build machine.
 
-The app still shows a Gatekeeper warning on **other** Macs (a self-signed cert
-isn't trusted by Apple — only notarization removes that). To bypass on another
-Mac: right-click Forge.app → Open → "Open Anyway", or
+To bypass on another Mac: right-click Forge.app → Open → "Open Anyway", or
 `xattr -dr com.apple.quarantine /Applications/Forge.app`.
 
-**One-time setup — create the `Forge Dev` certificate:**
-
-Open **Keychain Access** → menu **Certificate Assistant → Create a Certificate…**
-
-| Field | Value |
-|---|---|
-| Name | `Forge Dev` |
-| Identity Type | Self Signed Root |
-| Certificate Type | Code Signing |
-| Let me override defaults | ✓ (set validity to e.g. 3650 days) |
-
-It lands in your **login** keychain. Verify with:
-
-```bash
-security find-identity -p codesigning | grep "Forge Dev"
-```
-
-If you don't have this cert (e.g. a fresh clone on another machine), either
-create it as above, or set `CODE_SIGN_IDENTITY: "-"` in `project.yml` to fall
-back to ad-hoc signing.
+> **Why not a self-signed certificate?** We tried signing with a self-signed
+> `Forge Dev` cert to keep Keychain "Always Allow" and TCC grants sticky across
+> rebuilds. It works on the build machine, but a self-signed cert is only
+> trusted there — **distributed builds crashed on other Macs** (the cert chain
+> can't be validated, and the build also carried the `get-task-allow` debug
+> entitlement). Ad-hoc is the portable, free choice. The trade-off: Keychain may
+> re-prompt once per app upgrade (the prompt *storm* is already prevented by the
+> in-memory token cache in `GoogleKeychain`). Persistent grants + no Gatekeeper
+> warning on other Macs require a paid **Developer ID + notarization** (below).
 
 ### For Distribution (Apple Developer account required)
 
