@@ -302,7 +302,10 @@ struct SettingsView: View {
                         title: "Launch at login",
                         description: "Forge starts automatically when you sign in."
                     ) {
-                        Toggle("", isOn: .constant(false))
+                        Toggle("", isOn: Binding(
+                            get: { LaunchAtLogin.isEnabled },
+                            set: { LaunchAtLogin.setEnabled($0) }
+                        ))
                             .toggleStyle(.forge)
                             .labelsHidden()
                             .tint(ForgeTheme.Colors.accent)
