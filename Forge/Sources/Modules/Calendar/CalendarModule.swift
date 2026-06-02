@@ -209,7 +209,14 @@ final class CalendarModule: ForgeModule, ObservableObject {
                 // Google events when they arrive (dedupe by iCalUID —
                 // Google events also present in macOS Calendar would
                 // otherwise show twice).
-                self.events = ekEvents
+                //
+                // Only publish the EventKit set if it actually has events.
+                // If EventKit access is denied/empty (common — many users
+                // only connect Google), assigning the empty array here would
+                // blank the already-visible Google events on EVERY refresh —
+                // the "no meeting name every time I open the menu" flash.
+                // Keep what's shown until the merged set arrives below.
+                if !ekEvents.isEmpty { self.events = ekEvents }
 
                 Task { [weak self] in
                     let google = await GoogleCalendarService.shared.fetchAllEvents(

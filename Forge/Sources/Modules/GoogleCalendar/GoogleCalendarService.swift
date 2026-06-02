@@ -1181,60 +1181,103 @@ enum GoogleKeychain {
         UserDefaults.standard.removeObject(forKey: "google.exp.\(email)")
     }
 
-    // MARK: low-level
+    // MARK: low-level — file-backed store
+    //
+    // Tokens live in a 0600 JSON file in Application Support, NOT the macOS
+    // keychain. The keychain authorizes reads by the app's CODE SIGNATURE;
+    // Forge ships ad-hoc-signed (no paid Developer ID), so the signature
+    // differs across versions and machines and the keychain re-prompts
+    // ("Forge wants to use your confidential information") on every token
+    // read. Each prompt steals focus and dismisses the menu popover (the
+    // "crash"/"meeting name disappears" reports). A user-only file removes
+    // the prompt entirely, on every Mac. A refresh token at rest is a modest
+    // trade-off for a non-notarized beta — the file is readable only by the
+    // user's own account (0600).
+
+    private static var fileURL: URL {
+        let base = (try? FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true))
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support")
+        let dir = base.appendingPathComponent("Forge", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("google-tokens.json")
+    }
+
+    private static func loadFile() -> [String: String] {
+        guard let data = try? Data(contentsOf: fileURL),
+              let dict = try? JSONDecoder().decode([String: String].self, from: data)
+        else { return [:] }
+        return dict
+    }
+
+    private static func saveFile(_ dict: [String: String]) {
+        guard let data = try? JSONEncoder().encode(dict) else { return }
+        try? data.write(to: fileURL, options: .atomic)
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+    }
 
     private static func set(value: String, account: String) {
-        // Update the in-memory cache first so subsequent reads this launch
-        // never hit the keychain (and never re-prompt).
-        cacheLock.lock(); memCache[account] = value; cacheLock.unlock()
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        memCache[account] = value
+        var dict = loadFile()
+        dict[account] = value
+        saveFile(dict)
+    }
 
-        let data = Data(value.utf8)
+    private static func get(account: String) -> String? {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        if let cached = memCache[account] { return cached }
+        var dict = loadFile()
+        if let v = dict[account] { memCache[account] = v; return v }
+        // One-time, NON-prompting migration from the legacy keychain: pull
+        // the old token into the file only if it reads without UI (ACL still
+        // matches). If it would prompt, skip silently — the user reconnects
+        // Google once. Either way: no dialog ever appears.
+        if let migrated = migrateFromKeychain(account: account) {
+            dict[account] = migrated
+            saveFile(dict)
+            memCache[account] = migrated
+            return migrated
+        }
+        return nil
+    }
+
+    private static func deleteItem(account: String) {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        memCache[account] = nil
+        var dict = loadFile()
+        dict[account] = nil
+        saveFile(dict)
+        // Also clear any legacy keychain item (non-prompting delete).
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
         SecItemDelete(query as CFDictionary)
-        var attrs = query
-        attrs[kSecValueData as String] = data
-        SecItemAdd(attrs as CFDictionary, nil)
     }
 
-    private static func get(account: String) -> String? {
-        // Serve from the in-memory cache when we already read this value
-        // this launch — this is what stops the repeated keychain prompts.
-        cacheLock.lock()
-        if let cached = memCache[account] { cacheLock.unlock(); return cached }
-        cacheLock.unlock()
-
+    /// Reads a legacy keychain token WITHOUT ever showing a UI prompt
+    /// (`kSecUseAuthenticationUISkip`). Returns nil if the item needs
+    /// authorization, so migration never triggers the dialog we're removing.
+    private static func migrateFromKeychain(account: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip,
         ]
         var result: AnyObject?
         guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
               let data = result as? Data,
               let s = String(data: data, encoding: .utf8)
         else { return nil }
-
-        // Cache the successfully-read value so we don't ask the keychain
-        // (and the user) again for the rest of this launch.
-        cacheLock.lock(); memCache[account] = s; cacheLock.unlock()
         return s
-    }
-
-    private static func deleteItem(account: String) {
-        cacheLock.lock(); memCache[account] = nil; cacheLock.unlock()
-
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        SecItemDelete(query as CFDictionary)
     }
 }
 
