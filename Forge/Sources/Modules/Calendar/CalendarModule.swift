@@ -373,13 +373,24 @@ struct CalendarEvent: Identifiable {
     var isInvited: Bool { myResponseStatus != nil }
 
     init(from ekEvent: EKEvent) {
-        self.id = ekEvent.eventIdentifier
+        // EventKit exposes several of these as implicitly-unwrapped
+        // optionals (eventIdentifier, startDate, endDate) or as a nonnull
+        // property that is actually nil at runtime (`calendar`, for an
+        // orphaned event whose calendar was deleted). Reading any of them
+        // raw crashes with "unexpectedly found nil" — and ONLY on Macs that
+        // have granted Calendar access AND happen to have such an event, so
+        // it never reproduces where EventKit is denied. Default every value
+        // so a single malformed event can't take down the whole app.
+        self.id = ekEvent.eventIdentifier ?? UUID().uuidString
         self.title = ekEvent.title ?? "Untitled"
-        self.startDate = ekEvent.startDate
-        self.endDate = ekEvent.endDate
+        self.startDate = ekEvent.startDate ?? Date()
+        self.endDate = ekEvent.endDate ?? (ekEvent.startDate ?? Date())
         self.isAllDay = ekEvent.isAllDay
-        self.calendarColor = Color(cgColor: ekEvent.calendar.cgColor)
-        self.calendarTitle = ekEvent.calendar.title
+        // `calendar` is typed non-optional but can be nil — read via KVC so
+        // nil is tolerated, and fall back to a default color/title.
+        let ekCal = ekEvent.value(forKey: "calendar") as? EKCalendar
+        self.calendarColor = ekCal.map { Color(cgColor: $0.cgColor) } ?? ForgeTheme.Colors.accentBlue
+        self.calendarTitle = ekCal?.title ?? "Calendar"
         self.location = ekEvent.location
         self.notes = ekEvent.notes
         self.attendeeCount = ekEvent.attendees?.count ?? 0
