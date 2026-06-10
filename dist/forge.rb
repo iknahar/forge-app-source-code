@@ -1,6 +1,6 @@
 cask "forge" do
-  version "1.0.12"
-  sha256 "50dcdff72c52238ed0d97b1d50a1d37e5d213979afa2e99910423f7d5b0686b9"
+  version "1.0.13"
+  sha256 "16162139a4556f0fe0b74d48df10aae7c86749371f6c3d1019f46f459ac5cee8"
 
   url "https://github.com/iknahar/forge-app-source-code/releases/download/v#{version}/Forge-#{version}.dmg"
   name "Forge"

@@ -134,6 +134,32 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
         }
     }
 
+    /// True when a capture came back with no content at all — every
+    /// sampled pixel fully transparent. Real screen captures are always
+    /// fully opaque (alpha 255 everywhere), so full transparency is a
+    /// definitive "the window server refused us" signal, never a false
+    /// positive on a legitimately white/empty screen. Cheap: the image
+    /// is downsampled to 16×16 before inspection.
+    private static func captureLooksBlank(_ image: CGImage) -> Bool {
+        let w = 16, h = 16
+        guard let ctx = CGContext(
+            data: nil, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: w * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return false }
+        ctx.interpolationQuality = .low
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let buf = ctx.data else { return false }
+        let px = buf.bindMemory(to: UInt8.self, capacity: w * h * 4)
+        // RGBA — alpha is byte 3 of each pixel. Context memory starts
+        // zeroed, so any opacity in the source shows up here.
+        for i in stride(from: 3, to: w * h * 4, by: 4) where px[i] != 0 {
+            return false
+        }
+        return true
+    }
+
     /// Shown when Screen Recording permission is missing. Gives the user a
     /// one-click jump to the right Privacy pane in System Settings.
     private func presentScreenRecordingAlert() {
@@ -147,6 +173,11 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
 
         Open System Settings → Privacy & Security → Screen Recording, \
         enable Forge, then try the shortcut again.
+
+        Already enabled? After an app update macOS sometimes keeps an \
+        outdated approval that silently returns empty captures. Remove \
+        Forge from the list with the “–” button, add it back, and toggle \
+        it on again.
         """
         alert.addButton(withTitle: "Open System Settings")
         alert.addButton(withTitle: "Cancel")
@@ -176,6 +207,20 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
         ), fresh.width >= 8, fresh.height >= 8 {
             image = fresh
         } else {
+            NotificationCenter.default.post(name: .forgeAfterScreenshotDismiss, object: nil)
+            presentScreenRecordingAlert()
+            return
+        }
+
+        // A non-nil capture can still be EMPTY. On macOS 14+ the Screen
+        // Recording grant is pinned to the app's code signature; after an
+        // update changes the signature, CGPreflightScreenCaptureAccess()
+        // still returns true (the TCC row exists) but the window server
+        // hands back a fully-transparent image. The user then annotates
+        // an invisible screenshot and the export contains only their
+        // drawings. Detect the blank frame and guide them to re-grant
+        // instead of proceeding.
+        if Self.captureLooksBlank(image) {
             NotificationCenter.default.post(name: .forgeAfterScreenshotDismiss, object: nil)
             presentScreenRecordingAlert()
             return
