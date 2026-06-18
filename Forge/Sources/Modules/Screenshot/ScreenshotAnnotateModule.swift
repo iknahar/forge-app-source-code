@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Combine
 import UniformTypeIdentifiers
+import ScreenCaptureKit
 
 extension Notification.Name {
     /// Broadcast right before the screenshot module captures the screen.
@@ -63,16 +64,6 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
     /// translator to read source / target language preferences.
     weak var settingsRef: SettingsManager?
 
-    /// Image captured **synchronously** inside the Carbon hotkey handler,
-    /// *before* the `DispatchQueue.main.async` dispatch. By running in the
-    /// same runloop iteration as the key-down event, this preserves
-    /// transient UI (e.g. NSPopover with `.transient` behavior) that would
-    /// auto-dismiss on the very next runloop cycle. `startCapture()` checks
-    /// this first and falls back to an immediate capture if it's `nil`
-    /// (e.g. when the module is triggered programmatically rather than by
-    /// a hotkey).
-    var hotkeyPreCapture: CGImage?
-
     func activate() {}
     func deactivate() {
         dismissLightshot()
@@ -104,33 +95,73 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
             return
         }
 
-        // ── Use the pre-captured image if available ────────────────
-        // The hotkey handler captures the screen synchronously in the
-        // Carbon event callback — before any runloop cycle that would
-        // dismiss transient UI (like the Forge menu-bar popover). If
-        // that image exists, prefer it. Otherwise fall back to an
-        // immediate capture (for programmatic triggers, retry, etc.).
-        let earlyImage: CGImage?
-        if let pre = hotkeyPreCapture {
-            earlyImage = pre
-            hotkeyPreCapture = nil   // consume it — one-shot
-        } else {
-            guard let screen = NSScreen.main else { return }
-            earlyImage = CGWindowListCreateImage(
-                screen.frame, .optionOnScreenOnly, kCGNullWindowID, [.bestResolution]
-            )
-        }
-
-        // NOW dismiss other Forge overlays (mouse highlight, etc.)
-        // so they don't interfere with the annotation overlay. Their
-        // visuals are already baked into `earlyImage` above — that's
-        // acceptable since they're part of what the user sees on screen.
+        // Hide other Forge overlays (mouse highlight, etc.) so they aren't
+        // part of the shot. ScreenCaptureKit also excludes Forge's own
+        // windows below, but this clears transient visuals like the
+        // click-highlight ring.
         NotificationCenter.default.post(name: .forgeBeforeScreenshotCapture, object: nil)
 
-        // Short hop to let overlay orderOut flush, then show the
-        // annotation overlay with the already-captured image.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            self?.performCapture(preCaptured: earlyImage)
+        // Capture via ScreenCaptureKit — the supported API on macOS 14+.
+        // `CGWindowListCreateImage` is deprecated and on macOS 14+/15/26
+        // returns an EMPTY (fully transparent) frame regardless of the
+        // Screen Recording grant, which is what produced the "blank
+        // screenshot + permission prompt that loops forever" bug: no amount
+        // of re-granting could fix a neutered API. SCK returns real pixels
+        // once Screen Recording is granted, and lets us exclude Forge's own
+        // windows so the menu popover never lands in the capture.
+        captureScreenViaSCK { [weak self] image in
+            guard let self = self else { return }
+            guard let image = image, !Self.captureLooksBlank(image) else {
+                NotificationCenter.default.post(name: .forgeAfterScreenshotDismiss, object: nil)
+                self.presentScreenRecordingAlert()
+                return
+            }
+            self.performCapture(preCaptured: image)
+        }
+    }
+
+    /// Full-display screenshot via ScreenCaptureKit. Excludes Forge's own
+    /// windows so the menu popover / overlays never appear in the capture.
+    /// Completion is always delivered on the main queue (nil on failure).
+    private func captureScreenViaSCK(_ completion: @escaping (CGImage?) -> Void) {
+        guard let screen = NSScreen.main else { completion(nil); return }
+        let wantedID = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
+            as? CGDirectDisplayID) ?? CGMainDisplayID()
+        let scale = screen.backingScaleFactor
+        let pxW = Int(screen.frame.width * scale)
+        let pxH = Int(screen.frame.height * scale)
+
+        Task {
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(
+                    false, onScreenWindowsOnly: false
+                )
+                guard let display = content.displays.first(where: { $0.displayID == wantedID })
+                        ?? content.displays.first else {
+                    await MainActor.run { completion(nil) }
+                    return
+                }
+                // Exclude every window owned by Forge itself.
+                let ourApps = content.applications.filter {
+                    $0.bundleIdentifier == Bundle.main.bundleIdentifier
+                }
+                let filter = SCContentFilter(
+                    display: display, excludingApplications: ourApps, exceptingWindows: []
+                )
+                let config = SCStreamConfiguration()
+                config.width = max(1, pxW)
+                config.height = max(1, pxH)
+                config.showsCursor = false
+                config.scalesToFit = false
+
+                let image = try await SCScreenshotManager.captureImage(
+                    contentFilter: filter, configuration: config
+                )
+                await MainActor.run { completion(image) }
+            } catch {
+                NSLog("[Forge Screenshot] ScreenCaptureKit capture failed: \(error.localizedDescription)")
+                await MainActor.run { completion(nil) }
+            }
         }
     }
 
@@ -189,24 +220,18 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
         }
     }
 
-    /// - Parameter preCaptured: An image grabbed before overlays were
-    ///   dismissed. If `nil`, a fresh capture is taken now (fallback).
+    /// - Parameter preCaptured: The ScreenCaptureKit image from
+    ///   `startCapture()`. Already validated non-blank by the caller.
     private func performCapture(preCaptured: CGImage? = nil) {
         guard let screen = NSScreen.main else { return }
 
         let screenFrame = screen.frame
         let viewFrame = NSRect(origin: .zero, size: screenFrame.size)
 
-        // Use the early-captured image if available; fall back to a
-        // fresh capture (e.g. if called directly for a retry).
-        let image: CGImage
-        if let pre = preCaptured, pre.width >= 8, pre.height >= 8 {
-            image = pre
-        } else if let fresh = CGWindowListCreateImage(
-            screenFrame, .optionOnScreenOnly, kCGNullWindowID, [.bestResolution]
-        ), fresh.width >= 8, fresh.height >= 8 {
-            image = fresh
-        } else {
+        // The capture is produced by ScreenCaptureKit in `startCapture()`
+        // (CGWindowListCreateImage is dead on modern macOS). If it's somehow
+        // missing/too small, bail with the permission guidance.
+        guard let image = preCaptured, image.width >= 8, image.height >= 8 else {
             NotificationCenter.default.post(name: .forgeAfterScreenshotDismiss, object: nil)
             presentScreenRecordingAlert()
             return

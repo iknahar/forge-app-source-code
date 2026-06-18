@@ -487,19 +487,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         registerHotkey("fancyZones", binding: b["fancyZones"]) { [weak self] in
             self?.moduleRegistry.module(ofType: FancyZonesModule.self)?.openEditor()
         }
-        registerHotkey("screenshot", binding: b["screenshot"], syncPreAction: { [weak self] in
-            // Capture the screen SYNCHRONOUSLY inside the Carbon event
-            // handler, before the DispatchQueue.main.async dispatch. This
-            // preserves transient UI (e.g. Forge menu-bar popover with
-            // `.transient` behavior) that auto-dismisses on the next
-            // runloop cycle. The captured image is stashed on the module
-            // for startCapture() to pick up.
-            guard let module = self?.moduleRegistry.module(ofType: ScreenshotAnnotateModule.self),
-                  let screen = NSScreen.main else { return }
-            module.hotkeyPreCapture = CGWindowListCreateImage(
-                screen.frame, .optionOnScreenOnly, kCGNullWindowID, [.bestResolution]
-            )
-        }) { [weak self] in
+        registerHotkey("screenshot", binding: b["screenshot"]) { [weak self] in
+            // Screen capture now runs through ScreenCaptureKit inside
+            // startCapture(), which excludes Forge's own windows — so the
+            // old synchronous CGWindowListCreateImage pre-capture (to beat
+            // the popover dismiss) is no longer needed.
             self?.moduleRegistry.module(ofType: ScreenshotAnnotateModule.self)?.startCapture()
         }
         // Find My Mouse has no global hotkey — it's gesture-only
