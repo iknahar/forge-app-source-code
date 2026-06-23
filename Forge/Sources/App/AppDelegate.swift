@@ -385,6 +385,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         let zoomItModule = ZoomItModule()
         moduleRegistry.register(zoomItModule)
 
+        // Screen Recorder — SCStream → AVAssetWriter video capture (⌃⌥V)
+        let screenRecorderModule = ScreenRecorderModule()
+        moduleRegistry.register(screenRecorderModule)
+
         // FancyZones — custom window snap zone layouts (⌃⌥F)
         let fancyZonesModule = FancyZonesModule()
         moduleRegistry.register(fancyZonesModule)
@@ -484,6 +488,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         registerHotkey("zoomIt", binding: b["zoomIt"]) { [weak self] in
             self?.moduleRegistry.module(ofType: ZoomItModule.self)?.startZoom()
         }
+        registerHotkey("screenRecorder", binding: b["screenRecorder"]) { [weak self] in
+            self?.moduleRegistry.module(ofType: ScreenRecorderModule.self)?.toggleRecording()
+        }
         registerHotkey("fancyZones", binding: b["fancyZones"]) { [weak self] in
             self?.moduleRegistry.module(ofType: FancyZonesModule.self)?.openEditor()
         }
@@ -561,6 +568,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             moduleRegistry.module(ofType: TextExtractorModule.self)?.startExtracting()
         case "zoomIt":
             moduleRegistry.module(ofType: ZoomItModule.self)?.startZoom()
+        case "screenRecorder":
+            moduleRegistry.module(ofType: ScreenRecorderModule.self)?.toggleRecording()
         case "clipboard":
             guard let module = moduleRegistry.module(ofType: ClipboardModule.self) else { return false }
             ClipboardHistoryPanel.toggle(module: module)
@@ -591,6 +600,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         "screenRuler",
         "textExtractor",
         "zoomIt",
+        "screenRecorder",
         "clipboard",
         "claudeLauncher",
         "terminalLauncher",

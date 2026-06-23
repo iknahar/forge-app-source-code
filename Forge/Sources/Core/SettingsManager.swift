@@ -412,6 +412,7 @@ struct ShortcutBinding: Codable, Equatable {
         "screenRuler":      ShortcutBinding(keyCode: 15, modifiers: [.control, .option]),      // ⌃⌥R
         "textExtractor":    ShortcutBinding(keyCode: 17, modifiers: [.control, .option]),      // ⌃⌥T
         "zoomIt":           ShortcutBinding(keyCode: 6,  modifiers: [.control, .option]),      // ⌃⌥Z
+        "screenRecorder":   ShortcutBinding(keyCode: 9,  modifiers: [.control, .option]),      // ⌃⌥V
         "fancyZones":       ShortcutBinding(keyCode: 50, modifiers: [.option, .shift]),        // ⌥⇧` (backtick)
         "clipboard":        ShortcutBinding(keyCode: 9,  modifiers: [.option]),                // ⌥V
         "claudeLauncher":   ShortcutBinding(keyCode: 40, modifiers: [.control, .option]),      // ⌃⌥K
@@ -492,6 +493,9 @@ struct ShortcutBinding: Codable, Equatable {
               group: .screen, gestureLabel: nil),
         .init(id: "zoomIt", name: "ZoomIt",
               description: "Zoom into any part of the screen and draw on top — built for demos.",
+              group: .screen, gestureLabel: nil),
+        .init(id: "screenRecorder", name: "Screen Recorder",
+              description: "Record the screen to a video file. Press again to stop.",
               group: .screen, gestureLabel: nil),
 
         // Mouse & Highlights — Find My Mouse gesture + click highlighter.

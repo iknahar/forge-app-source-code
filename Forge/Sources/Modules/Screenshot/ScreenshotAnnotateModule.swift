@@ -280,7 +280,14 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
         // frame during makeKeyAndOrderFront(); an explicit setFrame post-
         // ordering is the safest belt-and-suspenders.
         window.setFrame(screenFrame, display: false)
+        // When the capture is triggered from the menu-bar popover, the popover
+        // closes and Forge (an .accessory app) resigns active — a plain
+        // makeKeyAndOrderFront on a borderless window then does NOT bring the
+        // overlay forward, so "nothing happens". Activate the app and order the
+        // window front unconditionally so the overlay always appears.
+        NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
         window.setFrame(screenFrame, display: true)
         window.makeFirstResponder(view)
         NSCursor.crosshair.push()
@@ -1377,19 +1384,25 @@ final class LightshotOverlayView: NSView {
         ctx.setFillColor(NSColor.black.withAlphaComponent(0.58).cgColor)
         ctx.fill(bounds)
 
-        // 3. Punch a hole in the veil for the selection (image shows
-        // through). Slight corner rounding (3pt) keeps the cutout
-        // edges from feeling hard against the now-darker dim.
-        if selection.width > 0, selection.height > 0 {
-            ctx.setBlendMode(.clear)
-            let path = CGPath(
+        // 3. Re-draw the FROZEN captured pixels at full brightness inside the
+        // selection, over the dim veil. This used to be a `.clear` blend that
+        // punched the selection to fully transparent — but that reveals
+        // whatever is compositing BEHIND the overlay window *right now* (a moved
+        // window, a popover that just closed, a different Space, or nothing at
+        // all → a black "cut"), NOT the frozen capture the user is framing.
+        // Clipping + redrawing `capturedImage` keeps the live selection
+        // identical to the saved crop and never shows a cut.
+        if selection.width > 0, selection.height > 0, let img = capturedImage {
+            ctx.saveGState()
+            let clip = CGPath(
                 roundedRect: selection,
                 cornerWidth: 3, cornerHeight: 3,
                 transform: nil
             )
-            ctx.addPath(path)
-            ctx.fillPath()
-            ctx.setBlendMode(.normal)
+            ctx.addPath(clip)
+            ctx.clip()
+            ctx.draw(img, in: bounds)        // full-brightness frozen pixels
+            ctx.restoreGState()
         }
 
         // 4. Selection border + dimensions chip + (annotating) corner handles.

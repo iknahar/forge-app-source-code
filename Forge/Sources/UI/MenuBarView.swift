@@ -350,6 +350,7 @@ struct MenuBarView: View {
         case "screenRuler":      bindingId = "screenRuler"
         case "textExtractor":    bindingId = "textExtractor"
         case "zoomIt":           bindingId = "zoomIt"
+        case "screenRecorder":   bindingId = "screenRecorder"
         case "fancyZones":       bindingId = "fancyZones"
         case "windowManager":    bindingId = "pinWindow"
         case "meetingReminder":  bindingId = "joinMeeting"
