@@ -1515,6 +1515,7 @@ struct EditorRootView: View {
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color.black)
+                .clipped()   // preview must never draw past its column into the inspector
 
                 Divider()
 
@@ -1540,7 +1541,9 @@ struct EditorRootView: View {
             // RIGHT: inspector (editing properties) — contextual to the selection
             InspectorView(state: state, onExport: export)
                 .frame(width: 300)
+                .frame(maxHeight: .infinity)
                 .background(Color(nsColor: .windowBackgroundColor))
+                .clipped()
         }
         .tint(Color.forgeAccent)     // brand red on all controls (buttons, sliders, pickers, toggles)
         .onDeleteCommand { state.deleteAnySelected() }   // Delete / ⌫ removes the selected element
@@ -1756,6 +1759,8 @@ struct PreviewContainer: View {
                 }
             }
             .coordinateSpace(name: "forgePreview")   // stable frame for drag math
+            .frame(width: viewSize.width, height: viewSize.height)
+            .clipped()   // keep the canvas (wallpaper/shadow/zoom/overlays) inside the preview
         }
     }
 
