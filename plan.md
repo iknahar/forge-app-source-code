@@ -1,7 +1,7 @@
 # Forge — Session Handoff & Plan
 
 > Living handoff so a fresh session can resume without losing context.
-> **Last updated after shipping v1.0.14.** Current released version: **1.0.14**.
+> **Last updated after shipping v1.0.16.** Current released version: **1.0.16**.
 > Build machine is on **macOS 26.5.1** (matters — see capture notes).
 
 ---
@@ -129,6 +129,26 @@ Commit trailer in use: `Co-Authored-By: Claude …`.
   has only the drawings (white when pasted). `captureLooksBlank()` downsamples to 16×16 and
   checks alpha; a fully-transparent frame ⇒ show the permission alert (now worded for the
   "already enabled but stale → remove with – and re-add" case) instead of proceeding.
+- **1.0.15** — **Screen/video recorder + FocuSee-style editor shipped** (the whole
+  `Modules/ScreenRecorder/` tree): full/region/window capture, auto-zoom-on-click +
+  manual zoom, cut/trim, arbitrary global & per-part speed (pitch-corrected `.spectral`),
+  12 macOS wallpapers (default 13-ventura-light) + gradients/colors, enlarged synthetic
+  cursor + click effects (ring/ripple/spotlight/sparkle), spotlight + region blur
+  (FocuSee settings, remembered defaults), webcam avatar (live bubble → editor overlay →
+  composited export, recorded movement path, white ring, bubble/fullscreen), mic select +
+  live mute, system-audio toggle, teleprompter, region/secondary-display coordinate-origin
+  fix, FocuSee-style picker + contextual inspector. ⚠️ Bundled Apple wallpapers are now
+  in the public repo + DMG (user approved knowingly).
+- **1.0.16** — Editor preview canvas **clipped to its column** (wallpaper/shadow/zoom/
+  overlays were bleeding into the inspector strip); inspector is a solid full-height panel.
+- **Recurring (every release, ad-hoc signing):** the update invalidates the
+  **Accessibility** grant → clipboard paste / text expansion / window snap silently die
+  (`AXIsProcessTrusted = false` in `~/Library/Logs/Forge/clipboard-paste.log`). Fix:
+  remove + re-add Forge in Privacy & Security → Accessibility (`tccutil reset
+  Accessibility com.toolkit.forge` clears stale entries). Durable fix still open — note
+  the self-signed cert was tried (1.0.5) and **reverted (1.0.8): crashed on other Macs**;
+  candidates: in-app `AXIsProcessTrustedWithOptions` prompt (cheap) and/or Developer ID
+  notarization (paid, §7).
 
 ---
 
