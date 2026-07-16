@@ -75,6 +75,10 @@ final class AppLockModule: ForgeModule, ObservableObject {
     /// Prevents multiple concurrent quit-attempt paths from spawning
     /// duplicate prompts.
     private var quitAuthInFlight = false
+    /// Floats a lock chip over each locked app's Dock icon while
+    /// armed, so the locked state is visible at a glance without
+    /// having to activate the app.
+    private let dockBadges = DockLockBadgeController()
 
     weak var registryRef: ModuleRegistry?
 
@@ -105,6 +109,7 @@ final class AppLockModule: ForgeModule, ObservableObject {
         }
         subscribeToAppEvents()
         installQuitEventMonitor()
+        dockBadges.start(bundleIds: selections.map { $0.bundleId })
         // If a selected app is currently frontmost at lock time,
         // cover it now — otherwise the just-locked app would stay
         // fully visible until the user Cmd+Tabs away and back.
@@ -118,6 +123,7 @@ final class AppLockModule: ForgeModule, ObservableObject {
     func deactivate() {
         unsubscribeFromAppEvents()
         removeQuitEventMonitor()
+        dockBadges.stop()
         for (_, w) in overlayWindows { w.orderOut(nil) }
         overlayWindows.removeAll()
         activeLocks.removeAll()
@@ -131,10 +137,12 @@ final class AppLockModule: ForgeModule, ObservableObject {
         guard !selections.contains(where: { $0.bundleId == bundleId }) else { return }
         selections.append(AppLockSelection(bundleId: bundleId, displayName: displayName))
         persist()
-        if isEnabled,
-           !NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).isEmpty,
-           let sel = selections.first(where: { $0.bundleId == bundleId }) {
-            presentOverlay(for: sel)
+        if isEnabled {
+            dockBadges.start(bundleIds: selections.map { $0.bundleId })
+            if !NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).isEmpty,
+               let sel = selections.first(where: { $0.bundleId == bundleId }) {
+                presentOverlay(for: sel)
+            }
         }
     }
 
@@ -142,6 +150,9 @@ final class AppLockModule: ForgeModule, ObservableObject {
         dismissOverlay(bundleId: bundleId)
         selections.removeAll { $0.bundleId == bundleId }
         persist()
+        if isEnabled {
+            dockBadges.start(bundleIds: selections.map { $0.bundleId })
+        }
     }
 
     // MARK: - Arm / disarm
