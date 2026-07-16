@@ -580,7 +580,7 @@ private struct AppLockToolbarButton: View {
     @State private var hovering = false
 
     private var isLocked: Bool { registry.isEnabled(module.id) }
-    private var canArm: Bool { module.hasPIN && !module.selections.isEmpty }
+    private var canArm: Bool { !module.selections.isEmpty }
 
     var body: some View {
         Button(action: click) {
@@ -602,7 +602,7 @@ private struct AppLockToolbarButton: View {
         .buttonStyle(.plain)
         .disabled(!isLocked && !canArm)
         .opacity((!isLocked && !canArm) ? 0.4 : 1)
-        .help(isLocked ? "Unlock (enter PIN)" : (canArm ? "Lock selected apps" : "Set a PIN and pick an app first"))
+        .help(isLocked ? "Unlock (Touch ID)" : (canArm ? "Lock selected apps" : "Pick an app first"))
         .onHover { hovering = $0 }
     }
 
@@ -615,7 +615,7 @@ private struct AppLockToolbarButton: View {
     }
 
     private func click() {
-        if isLocked { module.requestUnlock() }
+        if isLocked { module.presentUnlockOverlayAndAuthenticate() }
         else if canArm { module.armForLock() }
     }
 }

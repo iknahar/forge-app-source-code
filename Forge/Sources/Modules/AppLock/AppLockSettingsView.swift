@@ -3,30 +3,26 @@ import AppKit
 
 /// Settings → App Lock. Cards, top to bottom:
 ///
-///   1. Lock status — mirrors the "Lock selected apps?" toggle in the
-///      Tools popover. Toggle-on locks immediately; toggle-off pops
-///      the PIN prompt.
-///   2. PIN — the single global PIN, salted SHA-256.
-///   3. Lock now + shortcut — instant lock button plus the keyboard
-///      shortcut binding (same key unlocks with a PIN prompt).
-///   4. Selected apps — list the arm switch acts on.
+///   1. Lock status — mirrors the "Lock selected apps?" icon button
+///      in the Tools popover. Toggle-on locks immediately;
+///      toggle-off pops the biometric prompt.
+///   2. Lock now + shortcut — instant lock button + keyboard
+///      shortcut (⌘L by default).
+///   3. Selected apps — the list the arm switch acts on.
+///
+/// The entire section sits behind a session-lifetime biometric gate:
+/// modifying anything here (add app, remove app, arm state) needs
+/// Touch ID / password once per Forge run.
 struct AppLockSettingsView: View {
     @ObservedObject var module: AppLockModule
     @EnvironmentObject var moduleRegistry: ModuleRegistry
     @EnvironmentObject var settings: SettingsManager
 
     @State private var showingAddSheet = false
-    @State private var showingPINSheet = false
 
     var body: some View {
-        // Gate the entire section behind the PIN once per Forge run.
-        // Any modification here (add/remove app, change PIN, toggle
-        // arm state) needs the PIN first — regardless of whether
-        // the module is currently locked or unlocked. Skipped when
-        // no PIN exists yet, because the setup flow itself can't
-        // require a PIN.
         Group {
-            if module.hasPIN && !module.settingsSessionUnlocked {
+            if !module.settingsSessionUnlocked {
                 SettingsGate(module: module)
             } else {
                 settingsBody
@@ -37,34 +33,25 @@ struct AppLockSettingsView: View {
     private var settingsBody: some View {
         VStack(alignment: .leading, spacing: 24) {
             lockStatusCard
-            pinCard
             lockNowCard
-                .disabled(!module.hasPIN || module.selections.isEmpty)
-                .opacity((module.hasPIN && !module.selections.isEmpty) ? 1 : 0.55)
+                .disabled(module.selections.isEmpty)
+                .opacity(module.selections.isEmpty ? 0.55 : 1)
             selectedListCard
-                .disabled(!module.hasPIN)
-                .opacity(module.hasPIN ? 1 : 0.55)
         }
         .sheet(isPresented: $showingAddSheet) {
             AddSelectionSheet(module: module, isPresented: $showingAddSheet)
-        }
-        .sheet(isPresented: $showingPINSheet) {
-            SetPINSheet(module: module, isPresented: $showingPINSheet)
         }
     }
 
     private var isLocked: Bool { moduleRegistry.isEnabled(module.id) }
 
-    private var canArm: Bool {
-        module.hasPIN && !module.selections.isEmpty
-    }
+    private var canArm: Bool { !module.selections.isEmpty }
 
     // MARK: - Card 1: Lock status
 
-    /// The main arm switch. Turning ON locks instantly. Turning OFF
-    /// while locked pops the PIN prompt — the toggle itself doesn't
-    /// flip until the user enters the right PIN, because
-    /// `requestUnlock()` handles the flip on success.
+    /// Turning ON locks instantly. Turning OFF pops the biometric
+    /// prompt — the toggle only flips after successful auth
+    /// (handled inside `module.requestUnlock`).
     private var lockStatusCard: some View {
         HStack(spacing: 14) {
             Image(systemName: isLocked ? "lock.fill" : "lock.open.fill")
@@ -88,11 +75,8 @@ struct AppLockSettingsView: View {
                 get: { isLocked },
                 set: { newValue in
                     if newValue {
-                        // Lock immediately — no PIN required to lock.
                         if canArm { module.armForLock() }
                     } else {
-                        // Unlock — pops the PIN prompt. Actual flip
-                        // happens inside verify() → finishDisarm().
                         module.requestUnlock()
                     }
                 }
@@ -112,8 +96,8 @@ struct AppLockSettingsView: View {
     }
 
     private var statusTitle: String {
-        if isLocked { return "Locked. Selected apps behind a PIN." }
-        if !canArm  { return "Set a PIN and pick at least one app to lock." }
+        if isLocked { return "Locked. Selected apps behind Touch ID." }
+        if !canArm  { return "Pick at least one app to lock." }
         return "Unlocked. Flip on to lock."
     }
 
@@ -121,53 +105,14 @@ struct AppLockSettingsView: View {
         "Apps keep running in the background — notifications still arrive."
     }
 
-    // MARK: - Card 2: PIN
+    // MARK: - Card 2: Lock now + shortcut
 
-    private var pinCard: some View {
-        HStack(spacing: 14) {
-            Image(systemName: module.hasPIN ? "key.fill" : "key")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundColor(module.hasPIN ? ForgeTheme.Colors.accentGreen : ForgeTheme.Colors.textTertiary)
-                .frame(width: 32, height: 32)
-                .background(
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill((module.hasPIN ? ForgeTheme.Colors.accentGreen : ForgeTheme.Colors.textTertiary)
-                            .opacity(0.12))
-                )
-            VStack(alignment: .leading, spacing: 2) {
-                Text(module.hasPIN ? "PIN is set" : "No PIN yet")
-                    .font(.system(size: 13, weight: .semibold))
-                Text("One PIN, used for every locked app.")
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-            }
-            Spacer()
-            Button(module.hasPIN ? "Change PIN…" : "Set PIN…") {
-                showingPINSheet = true
-            }
-            .buttonStyle(.bordered)
-        }
-        .padding(16)
-        .background(ForgeTheme.Colors.surfaceCard)
-        .clipShape(RoundedRectangle(cornerRadius: ForgeTheme.Radius.medium))
-        .overlay(
-            RoundedRectangle(cornerRadius: ForgeTheme.Radius.medium)
-                .stroke(ForgeTheme.Colors.borderDefault, lineWidth: 1)
-        )
-    }
-
-    // MARK: - Card 3: Lock now + shortcut
-
-    /// Shows the currently-assigned "Lock / Unlock" shortcut and a
-    /// button that fires the same action programmatically. Same key
-    /// does both directions — the caption spells that out so users
-    /// don't think there's a second shortcut for unlocking.
     private var lockNowCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Lock now")
                     .font(.system(size: 15, weight: .semibold))
-                Text("Locks every selected app instantly. Same shortcut opens the PIN prompt while locked.")
+                Text("Locks every selected app instantly. Same shortcut prompts for Touch ID while locked.")
                     .font(.system(size: 12))
                     .foregroundColor(.secondary)
             }
@@ -176,8 +121,8 @@ struct AppLockSettingsView: View {
                     if isLocked { module.requestUnlock() }
                     else        { module.armForLock() }
                 } label: {
-                    Label(isLocked ? "Enter PIN to unlock" : "Lock now",
-                          systemImage: isLocked ? "lock.open" : "lock.fill")
+                    Label(isLocked ? "Unlock with Touch ID" : "Lock now",
+                          systemImage: isLocked ? "touchid" : "lock.fill")
                         .font(.system(size: 12, weight: .semibold))
                 }
                 .buttonStyle(.borderedProminent)
@@ -209,15 +154,12 @@ struct AppLockSettingsView: View {
         )
     }
 
-    /// Pull the current binding from SettingsManager and render it
-    /// with the same symbol convention the rest of the app uses
-    /// (⌃⌥⇧⌘ + key char). If unset, show a dash.
     private var shortcutDisplay: String {
         guard let b = settings.shortcutBindings["appLock"] else { return "—" }
         return b.displayString
     }
 
-    // MARK: - Card 4: Selected apps
+    // MARK: - Card 3: Selected apps
 
     private var selectedListCard: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -225,7 +167,7 @@ struct AppLockSettingsView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Locked apps")
                         .font(.system(size: 15, weight: .semibold))
-                    Text("When locked, every app in this list gets covered by the PIN prompt on activation.")
+                    Text("When locked, every app in this list gets covered by the Touch ID prompt on activation.")
                         .font(.system(size: 12))
                         .foregroundColor(.secondary)
                 }
@@ -287,49 +229,41 @@ struct AppLockSettingsView: View {
 
 // MARK: - Settings gate
 
-/// One-time PIN gate at the top of the App Lock settings page.
-/// Blocks the actual controls (add/remove app, change PIN, arm
-/// toggle) until the user proves ownership. Success flips a
-/// session-lifetime flag on the module — no re-prompting for the
-/// rest of this Forge run, but a fresh launch re-gates.
+/// Biometric-only gate at the top of the App Lock settings page.
+/// Blocks the arm toggle + selection list until the user proves
+/// ownership via Touch ID (or macOS password fallback on Macs
+/// without biometrics). Success flips a session-lifetime flag on
+/// the module — no re-prompting for the rest of this Forge run.
 private struct SettingsGate: View {
     @ObservedObject var module: AppLockModule
 
-    @State private var pin: String = ""
-    @State private var errorMessage: String? = nil
+    @State private var lastAttemptFailed: Bool = false
     @State private var shake: Bool = false
-    @FocusState private var focused: Bool
-
-    private let pinLength = 4
 
     var body: some View {
-        VStack(spacing: 18) {
+        VStack(spacing: 20) {
             Image(systemName: "lock.shield.fill")
                 .font(.system(size: 36, weight: .semibold))
                 .foregroundColor(ForgeTheme.Colors.accent)
                 .padding(.top, 6)
 
-            Text(module.biometricsAvailable
-                 ? "Authenticate to modify App Lock"
-                 : "Enter PIN to modify App Lock")
+            Text("Authenticate to modify App Lock")
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundColor(ForgeTheme.Colors.textPrimary)
-            Text("Every change here — adding apps, removing apps, changing the PIN — needs Touch ID or your PIN first.")
+            Text("Every change here — adding apps, removing apps, arming the lock — needs Touch ID first.")
                 .font(.system(size: 12))
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 360)
 
-            authWidget
+            fingerprintButton
                 .modifier(GateShake(shake: shake))
 
-            if let msg = errorMessage {
-                Text(msg)
+            if lastAttemptFailed {
+                Text("Tap to try again")
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(ForgeTheme.Colors.accentRed)
+                    .foregroundColor(.secondary)
             }
-
-            hiddenPINField
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 40)
@@ -342,102 +276,30 @@ private struct SettingsGate: View {
             RoundedRectangle(cornerRadius: 14)
                 .stroke(ForgeTheme.Colors.borderDefault, lineWidth: 1)
         )
-        .onAppear {
-            focused = true
-            // Auto-prompt Touch ID on section-open so users don't
-            // have to reach for the keyboard. Falls through to PIN
-            // silently on cancel / no biometric hardware.
-            if module.biometricsAvailable { runTouchID() }
-        }
-        .onChange(of: pin) { newValue in
-            let digits = newValue.filter { $0.isNumber }
-            if digits != newValue {
-                pin = String(digits.prefix(pinLength))
-                return
-            }
-            if newValue.count > pinLength {
-                pin = String(newValue.prefix(pinLength))
-                return
-            }
-            errorMessage = nil
-            if newValue.count == pinLength { submit() }
-        }
+        .onAppear { runAuth() }
     }
 
-    /// Merged auth widget for the settings gate — same shape as the
-    /// lock overlay but on a light card background instead of a
-    /// dark one, so the colors flip.
-    private var authWidget: some View {
-        HStack(spacing: 18) {
-            if module.biometricsAvailable {
-                Button(action: runTouchID) {
-                    Image(systemName: "touchid")
-                        .font(.system(size: 22, weight: .semibold))
-                        .foregroundColor(ForgeTheme.Colors.accent)
-                        .frame(width: 40, height: 40)
-                        .background(
-                            Circle().fill(ForgeTheme.Colors.accent.opacity(0.12))
-                        )
-                        .overlay(
-                            Circle().stroke(ForgeTheme.Colors.accent.opacity(0.35), lineWidth: 1)
-                        )
-                }
-                .buttonStyle(.plain)
-                .help("Tap for Touch ID")
-
-                Circle()
-                    .fill(ForgeTheme.Colors.textTertiary.opacity(0.5))
-                    .frame(width: 3, height: 3)
-            }
-
-            HStack(spacing: 14) {
-                ForEach(0..<pinLength, id: \.self) { idx in
-                    let filled = idx < pin.count
-                    Circle()
-                        .stroke(ForgeTheme.Colors.textTertiary.opacity(filled ? 0 : 0.55), lineWidth: 1.5)
-                        .background(
-                            Circle().fill(filled ? ForgeTheme.Colors.accent : Color.clear)
-                        )
-                        .frame(width: 14, height: 14)
-                        .animation(.spring(response: 0.2, dampingFraction: 0.7), value: filled)
-                }
-            }
-            .contentShape(Rectangle())
-            .onTapGesture { focused = true }
+    private var fingerprintButton: some View {
+        Button(action: runAuth) {
+            Image(systemName: "touchid")
+                .font(.system(size: 30, weight: .semibold))
+                .foregroundColor(ForgeTheme.Colors.accent)
+                .frame(width: 60, height: 60)
+                .background(Circle().fill(ForgeTheme.Colors.accent.opacity(0.12)))
+                .overlay(Circle().stroke(ForgeTheme.Colors.accent.opacity(0.35), lineWidth: 1))
         }
+        .buttonStyle(.plain)
+        .help("Tap for Touch ID")
     }
 
-    /// Same offscreen-SecureField trick as the lock overlay: real
-    /// editable field drives the model, the dot row above is
-    /// purely visual.
-    private var hiddenPINField: some View {
-        SecureField("", text: $pin)
-            .textFieldStyle(.plain)
-            .focused($focused)
-            .frame(width: 1, height: 1)
-            .opacity(0.01)
-            .accessibilityLabel("PIN")
-            .onSubmit { submit() }
-    }
-
-    private func submit() {
-        if module.checkPIN(pin) {
-            module.settingsSessionUnlocked = true
-        } else {
-            withAnimation(.default) { shake.toggle() }
-            errorMessage = "Wrong PIN."
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                pin = ""
-                focused = true
+    private func runAuth() {
+        module.authenticate(reason: "Modify App Lock settings") { ok in
+            if ok {
+                module.settingsSessionUnlocked = true
+            } else {
+                withAnimation(.default) { shake.toggle() }
+                lastAttemptFailed = true
             }
-        }
-    }
-
-    /// Touch ID path for the settings gate. Success flips the
-    /// session-unlocked flag — same target state as a correct PIN.
-    private func runTouchID() {
-        module.authenticateWithBiometrics(reason: "Modify App Lock settings") { ok in
-            if ok { module.settingsSessionUnlocked = true }
         }
     }
 }
@@ -605,96 +467,6 @@ private struct AddSelectionSheet: View {
     private func submit() {
         guard let sel = selected else { return }
         module.addSelection(bundleId: sel.bundleId, displayName: sel.name)
-        isPresented = false
-    }
-}
-
-// MARK: - Set / Change PIN sheet
-
-private struct SetPINSheet: View {
-    @ObservedObject var module: AppLockModule
-    @Binding var isPresented: Bool
-
-    @State private var oldPIN: String = ""
-    @State private var pin: String = ""
-    @State private var confirm: String = ""
-    @State private var error: String? = nil
-
-    private var isChanging: Bool { module.hasPIN }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text(isChanging ? "Change PIN" : "Set PIN")
-                .font(.system(size: 18, weight: .semibold))
-            Text(isChanging
-                 ? "Enter the current PIN, then pick a new one."
-                 : "4 digits. Same PIN unlocks every locked app.")
-                .font(.system(size: 11))
-                .foregroundColor(.secondary)
-
-            // Only shown on rotation. Setup has no PIN yet, so this
-            // field would be meaningless the first time.
-            if isChanging {
-                pinField(text: $oldPIN, placeholder: "Current PIN")
-            }
-
-            HStack(spacing: 10) {
-                pinField(text: $pin, placeholder: "New PIN")
-                pinField(text: $confirm, placeholder: "Confirm")
-            }
-
-            if let error {
-                Text(error)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(ForgeTheme.Colors.accentRed)
-            }
-
-            HStack {
-                Spacer()
-                Button("Cancel") { isPresented = false }
-                    .keyboardShortcut(.cancelAction)
-                Button("Save", action: submit)
-                    .keyboardShortcut(.defaultAction)
-                    .buttonStyle(.borderedProminent)
-                    .tint(ForgeTheme.Colors.accent)
-                    .disabled(
-                        pin.count < 4
-                            || pin != confirm
-                            || (isChanging && oldPIN.count < 4)
-                    )
-            }
-        }
-        .padding(22)
-        .frame(width: 380)
-    }
-
-    private func pinField(text: Binding<String>, placeholder: String) -> some View {
-        SecureField(placeholder, text: text)
-            .textFieldStyle(.plain)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .background(ForgeTheme.Colors.surfaceInput)
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .onChange(of: text.wrappedValue) { newValue in
-                let digits = newValue.filter { $0.isNumber }
-                if digits != newValue { text.wrappedValue = String(digits.prefix(4)) }
-                else if newValue.count > 4 { text.wrappedValue = String(newValue.prefix(4)) }
-            }
-    }
-
-    private func submit() {
-        guard pin.count >= 4 else { error = "PIN must be 4 digits."; return }
-        guard pin == confirm else { error = "PINs don't match."; return }
-        if isChanging {
-            let ok = module.changePIN(oldPIN: oldPIN, newPIN: pin)
-            if !ok {
-                error = "Current PIN is wrong."
-                oldPIN = ""
-                return
-            }
-        } else {
-            module.setPIN(pin)
-        }
         isPresented = false
     }
 }

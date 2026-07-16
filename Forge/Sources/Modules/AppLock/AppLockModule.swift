@@ -1,12 +1,12 @@
 import SwiftUI
 import AppKit
 import Combine
-import CryptoKit
 import LocalAuthentication
 
 // MARK: - Types
 
-/// One selected app. No PIN here — the PIN is global.
+/// One selected app. No credential state — auth is delegated
+/// entirely to macOS (`.deviceOwnerAuthentication`).
 struct AppLockSelection: Codable, Identifiable, Hashable {
     var bundleId: String
     var displayName: String
@@ -17,18 +17,17 @@ struct AppLockSelection: Codable, Identifiable, Hashable {
 
 private struct AppLockConfig: Codable {
     var selections: [AppLockSelection] = []
-    var pinHash: String = ""
-    var pinSalt: String = ""
 }
 
 // MARK: - Module
 
-/// Selectively locks apps with a single global PIN. Locked apps keep
-/// running in the background — Slack still receives DMs, badges still
-/// bump, notifications still fire — but any window belonging to a
-/// locked app gets covered by a full-screen PIN prompt the moment
-/// it becomes active. This is intentionally weaker than a SIGSTOP:
-/// the user wanted background delivery preserved.
+/// Selectively locks apps behind a system biometric prompt. Locked
+/// apps keep running in the background — Slack still receives DMs,
+/// badges still bump, notifications still fire — but any window
+/// belonging to a locked app gets covered by an overlay the moment
+/// it becomes active. The user unlocks with Touch ID (or the macOS
+/// password on Macs without a fingerprint reader — `LAContext`'s
+/// `.deviceOwnerAuthentication` policy handles both).
 ///
 /// Locking model:
 ///   • `isEnabled == true` — module is *locked*. Every selected app
@@ -36,17 +35,14 @@ private struct AppLockConfig: Codable {
 ///   • `isEnabled == false` — module is *unlocked*. Nothing is
 ///     intercepted.
 ///
-/// The user drives the transition through three interchangeable
-/// entry points (Tools popover toggle, Settings arm card toggle,
-/// global shortcut). All of them route through:
-///   • `armForLock()` — locks immediately (unlocked → locked).
-///   • `requestUnlock()` — pops a floating PIN window; correct PIN
-///     flips to unlocked.
+/// User entry points to the transition — Tools popover lock icon,
+/// Settings arm toggle, ⌘L shortcut — all route through
+/// `armForLock()` / `requestUnlock()`.
 final class AppLockModule: ForgeModule, ObservableObject {
 
     let id          = "appLock"
     let name        = "Lock selected apps"
-    let description = "Freeze Slack, Chrome, etc. behind a PIN while notifications keep flowing in the background"
+    let description = "Freeze Slack, Chrome, etc. behind Touch ID while notifications keep flowing in the background"
     let iconName    = "lock.app.dashed"
     let category: ModuleCategory = .system
     var isEnabled: Bool = false
@@ -54,52 +50,32 @@ final class AppLockModule: ForgeModule, ObservableObject {
     // MARK: - Published
 
     @Published private(set) var selections: [AppLockSelection] = []
-    /// bundleId → currently painted with a lock overlay. UI reads
-    /// this to show a "LOCKED" chip per row.
+    /// bundleId → currently painted with an overlay. UI reads this to
+    /// show a "LOCKED" chip per row.
     @Published private(set) var activeLocks: Set<String> = []
-    @Published private(set) var hasPIN: Bool = false
     /// Session-lifetime gate for the Settings → App Lock section.
-    /// Any modification (add app, remove app, change PIN, toggle
-    /// selection state) requires the user to punch the PIN in first
-    /// on this Forge run. Reset every launch, never persisted — a
-    /// fresh session always re-prompts.
+    /// Any modification (add app, remove app, toggle arm state)
+    /// requires biometric verification once per Forge run. Reset
+    /// every launch, never persisted.
     @Published var settingsSessionUnlocked: Bool = false
 
     // MARK: - Internals
 
-    private var pinHash: String = ""
-    private var pinSalt: String = ""
-
     private var activationObserver: NSObjectProtocol?
     /// Consumes Cmd+Q / Cmd+W / Cmd+H while a lock overlay is the
     /// key window. Without this, Cmd+Q quits Forge itself → every
-    /// overlay window is destroyed → locked apps become visible
-    /// without a PIN. With this, those shortcuts terminate the
-    /// locked app instead (which then re-locks itself on next
-    /// launch via the activation observer).
+    /// overlay window is destroyed → locked apps become visible.
+    /// With this, those shortcuts terminate the locked app instead.
     private var quitEventMonitor: Any?
-    /// Per-app blocking overlays. One entry per app that's currently
-    /// covered by a PIN prompt on screen.
+    /// Per-app blocking overlays.
     private var overlayWindows: [String: NSWindow] = [:]
-    /// The floating unlock window that pops when the user triggers
-    /// disarm without a specific app in focus. Separate from
-    /// `overlayWindows` because it isn't tied to any bundleId.
+    /// Floating unlock window (triggered by ⌘L when no locked app
+    /// is frontmost).
     private var unlockWindow: NSWindow?
-    /// Modal window shown when the user tries to quit Forge while
-    /// the module is armed. Success authorises the quit without
-    /// disarming the module (so the locked apps stay locked in
-    /// the *next* Forge run — assuming the user relaunches).
-    private var quitConfirmWindow: NSWindow?
-    /// Latched callback so multiple concurrent quit-attempt paths
-    /// (⌘Q, dock right-click, Cmd+Q from the popover) don't spawn
-    /// duplicate windows. First caller wins; subsequent calls
-    /// resolve to false immediately.
-    private var pendingQuitCompletion: ((Bool) -> Void)?
+    /// Prevents multiple concurrent quit-attempt paths from spawning
+    /// duplicate prompts.
+    private var quitAuthInFlight = false
 
-    /// Set by AppDelegate right after registration. Used so
-    /// `armForLock()` and `finishDisarm()` can drive the same
-    /// activate / deactivate + persistence path that a user-driven
-    /// toggle does — without duplicating the bookkeeping.
     weak var registryRef: ModuleRegistry?
 
     private static let configURL: URL = {
@@ -117,20 +93,13 @@ final class AppLockModule: ForgeModule, ObservableObject {
     init() {
         let cfg = Self.loadConfig()
         self.selections = cfg.selections
-        self.pinHash = cfg.pinHash
-        self.pinSalt = cfg.pinSalt
-        self.hasPIN = !cfg.pinHash.isEmpty
     }
 
     // MARK: - ForgeModule
 
-    /// Called when the registry flips `isEnabled` to true. We refuse
-    /// to lock without both a PIN and at least one selection —
-    /// otherwise the user would end up in a locked state they
-    /// couldn't clear. Guard is defensive; the UI blocks the same
-    /// path.
     func activate() {
-        guard hasPIN, !selections.isEmpty else {
+        guard !selections.isEmpty else {
+            // No apps to lock — silently stay off.
             isEnabled = false
             return
         }
@@ -139,8 +108,6 @@ final class AppLockModule: ForgeModule, ObservableObject {
         // If a selected app is currently frontmost at lock time,
         // cover it now — otherwise the just-locked app would stay
         // fully visible until the user Cmd+Tabs away and back.
-        // Dismiss-on-switch handles the "user goes to another app"
-        // case, so this doesn't lock the user out of the machine.
         if let front = NSWorkspace.shared.frontmostApplication,
            let bid = front.bundleIdentifier,
            let sel = selections.first(where: { $0.bundleId == bid }) {
@@ -157,48 +124,13 @@ final class AppLockModule: ForgeModule, ObservableObject {
         dismissUnlockWindow()
     }
 
-    // MARK: - Public API — arm / disarm
-
-    /// Toggle-on / shortcut-when-unlocked path. Direct arm, no
-    /// confirmation needed (nothing is locked yet, so this can't
-    /// hurt).
-    func armForLock() {
-        guard hasPIN, !selections.isEmpty else { return }
-        guard !isEnabled, let reg = registryRef else { return }
-        reg.toggleModule(id)   // sets isEnabled=true → activate()
-    }
-
-    /// Toggle-off / shortcut-when-locked path. Pops the floating
-    /// unlock window. Correct PIN in there calls `finishDisarm()`.
-    /// If already unlocked, this is a no-op.
-    func requestUnlock() {
-        guard isEnabled else { return }
-        presentUnlockWindow()
-    }
-
-    /// Called by the unlock window after a correct PIN verify. Flips
-    /// the module off through the registry so state persists.
-    private func finishDisarm() {
-        guard isEnabled, let reg = registryRef else { return }
-        reg.toggleModule(id)   // sets isEnabled=false → deactivate()
-    }
-
-    /// The one shortcut the user binds — Ctrl-Alt-L by default.
-    /// Same key does both jobs: lock when unlocked, request unlock
-    /// when locked. Toggle-like but PIN-gated on the disarm half.
-    func toggleFromShortcut() {
-        if isEnabled { requestUnlock() }
-        else         { armForLock() }
-    }
-
-    // MARK: - Selection list
+    // MARK: - Selections
 
     func addSelection(bundleId: String, displayName: String) {
         guard !bundleId.isEmpty else { return }
         guard !selections.contains(where: { $0.bundleId == bundleId }) else { return }
         selections.append(AppLockSelection(bundleId: bundleId, displayName: displayName))
         persist()
-        // Cover the app right now if it's running while we're armed.
         if isEnabled,
            !NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).isEmpty,
            let sel = selections.first(where: { $0.bundleId == bundleId }) {
@@ -206,120 +138,97 @@ final class AppLockModule: ForgeModule, ObservableObject {
         }
     }
 
-    /// Removing a selection while armed — release its overlay
-    /// immediately. Doesn't touch the module's arm state.
     func removeSelection(bundleId: String) {
         dismissOverlay(bundleId: bundleId)
         selections.removeAll { $0.bundleId == bundleId }
         persist()
     }
 
-    // MARK: - PIN
+    // MARK: - Arm / disarm
 
-    /// First-time PIN setup only. Refuses to overwrite an existing
-    /// PIN — the Change-PIN flow (which requires the old PIN) is the
-    /// only way to rotate once a PIN exists.
-    func setPIN(_ pin: String) {
-        guard pin.count >= 4 else { return }
-        guard !hasPIN else { return }
-        pinSalt = Self.randomSaltHex()
-        pinHash = Self.hash(pin: pin, saltHex: pinSalt)
-        hasPIN = true
-        persist()
+    func armForLock() {
+        guard !selections.isEmpty else { return }
+        guard !isEnabled, let reg = registryRef else { return }
+        reg.toggleModule(id)
     }
 
-    /// Rotate an existing PIN. Requires the old PIN to succeed —
-    /// without this, anyone with access to the settings window
-    /// could silently replace the PIN and lock the user out (or
-    /// bypass their intent). Returns false on wrong old PIN or too-
-    /// short new PIN; caller surfaces the error.
-    @discardableResult
-    func changePIN(oldPIN: String, newPIN: String) -> Bool {
-        guard hasPIN, newPIN.count >= 4 else { return false }
-        guard checkPIN(oldPIN) else { return false }
-        pinSalt = Self.randomSaltHex()
-        pinHash = Self.hash(pin: newPIN, saltHex: pinSalt)
-        persist()
-        return true
+    /// Unlock path. Fires the system biometric prompt immediately
+    /// (falls back to macOS password if Touch ID isn't enrolled).
+    /// Success disarms the module through the registry.
+    func requestUnlock() {
+        guard isEnabled else { return }
+        authenticate(reason: "Unlock apps") { [weak self] ok in
+            guard ok, let self = self else { return }
+            self.dismissUnlockWindow()
+            self.finishDisarm()
+        }
     }
 
-    // MARK: - Biometrics (Touch ID)
-
-    /// True on Macs with a working Touch ID enrolment. Recomputed on
-    /// every access because sensor availability can change (user
-    /// re-enrolls a fingerprint, plugs in a Touch ID keyboard, etc.).
-    var biometricsAvailable: Bool {
-        var error: NSError?
-        return LAContext().canEvaluatePolicy(
-            .deviceOwnerAuthenticationWithBiometrics,
-            error: &error
-        )
+    /// Present the floating unlock overlay. Used by the ⌘L shortcut
+    /// when no locked app is currently frontmost — gives the user
+    /// somewhere to focus while macOS's own biometric prompt sits
+    /// on top of it.
+    func presentUnlockOverlayAndAuthenticate() {
+        guard isEnabled else { return }
+        presentUnlockWindow()
+        authenticate(reason: "Unlock apps") { [weak self] ok in
+            guard let self = self else { return }
+            if ok {
+                self.dismissUnlockWindow()
+                self.finishDisarm()
+            }
+            // On fail/cancel, the unlock window stays up — the user
+            // taps the fingerprint icon inside it to retry.
+        }
     }
 
-    /// Run the system Touch ID prompt asynchronously. Completion
-    /// always fires on the main queue so UI code can flip state
-    /// without extra dispatch. Passes `true` only on successful
-    /// biometric verification — cancel, fallback-to-password, and
-    /// LA errors all resolve to `false`.
-    func authenticateWithBiometrics(reason: String, completion: @escaping (Bool) -> Void) {
-        // A fresh context per call — reusing one across attempts
-        // caches the previous result and can bypass the prompt in
-        // ways we don't want here.
+    private func finishDisarm() {
+        guard isEnabled, let reg = registryRef else { return }
+        reg.toggleModule(id)
+    }
+
+    /// One shortcut for both directions. Locks if unlocked, prompts
+    /// for biometrics if locked.
+    func toggleFromShortcut() {
+        if isEnabled { presentUnlockOverlayAndAuthenticate() }
+        else         { armForLock() }
+    }
+
+    // MARK: - Authentication
+
+    /// Fires the system `LAContext` prompt. On Touch ID Macs the
+    /// user sees the fingerprint sensor prompt; on Macs without a
+    /// sensor, macOS falls back to the standard password entry
+    /// (both cases handled by `.deviceOwnerAuthentication`).
+    /// Completion always runs on the main queue.
+    func authenticate(reason: String, completion: @escaping (Bool) -> Void) {
+        // Fresh context per call — reusing caches the previous
+        // result and can silently skip the prompt.
         let ctx = LAContext()
-        // "Touch ID" localized reason is what the system shows on
-        // the prompt; keep it action-specific ("Unlock Slack",
-        // "Modify App Lock settings") so users know why.
-        ctx.localizedFallbackTitle = ""   // hide "Enter Password" fallback — PIN is our fallback
         var error: NSError?
         guard ctx.canEvaluatePolicy(
-            .deviceOwnerAuthenticationWithBiometrics,
+            .deviceOwnerAuthentication,
             error: &error
         ) else {
             completion(false); return
         }
         ctx.evaluatePolicy(
-            .deviceOwnerAuthenticationWithBiometrics,
+            .deviceOwnerAuthentication,
             localizedReason: reason
         ) { ok, _ in
             DispatchQueue.main.async { completion(ok) }
         }
     }
 
-    /// Convenience: Touch ID for the full unlock flow. Same side
-    /// effects as a correct PIN — dismisses the unlock window and
-    /// disarms the module.
-    func unlockWithBiometrics(reason: String, completion: @escaping (Bool) -> Void) {
-        authenticateWithBiometrics(reason: reason) { [weak self] ok in
-            if ok {
-                self?.dismissUnlockWindow()
-                self?.finishDisarm()
-            }
-            completion(ok)
-        }
-    }
-
-    /// Constant-time compare against the stored PIN hash. Side-effect
-    /// free — the caller decides what to do on success. The PIN
-    /// space is 10^4 so an early-out mismatch would leak digit-by-
-    /// digit correctness via timing.
-    func checkPIN(_ pin: String) -> Bool {
-        guard !pinHash.isEmpty else { return false }
-        let candidate = Self.hash(pin: pin, saltHex: pinSalt)
-        guard candidate.count == pinHash.count else { return false }
-        var diff: UInt8 = 0
-        for (a, b) in zip(candidate.utf8, pinHash.utf8) { diff |= a ^ b }
-        return diff == 0
-    }
-
-    /// Called from both the per-app overlay and the floating unlock
-    /// window. On success, disarms the module entirely — every
-    /// locked app comes back at once.
-    @discardableResult
-    func verify(pin: String) -> Bool {
-        guard checkPIN(pin) else { return false }
-        dismissUnlockWindow()
-        finishDisarm()
-        return true
+    /// UI convenience — every host machine can authenticate somehow
+    /// (Touch ID, watch, password), so we always render the auth
+    /// widget. Kept as a computed for future hardware gating.
+    var authenticationAvailable: Bool {
+        var error: NSError?
+        return LAContext().canEvaluatePolicy(
+            .deviceOwnerAuthentication,
+            error: &error
+        )
     }
 
     // MARK: - App activation
@@ -334,26 +243,22 @@ final class AppLockModule: ForgeModule, ObservableObject {
                   let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
             else { return }
             let bid = app.bundleIdentifier
-            // Own app activating? Ignore — otherwise pulling the
-            // Forge menu bar down while locked would dismiss the
-            // overlay covering the locked app.
             if bid == Bundle.main.bundleIdentifier { return }
             if let bid = bid, let sel = self.selections.first(where: { $0.bundleId == bid }) {
-                // Locked app came to front → cover it.
                 self.presentOverlay(for: sel)
             } else {
-                // Switched to a non-locked app. Take the overlay
-                // down so this app is actually usable — otherwise
-                // the screensaver-level window would keep sitting
-                // on top of the new frontmost app.
                 self.dismissAllAppOverlays()
             }
         }
     }
 
-    /// Tears down every per-app overlay (not the floating unlock
-    /// window — that has its own dismissal path). Called when the
-    /// user switches to any app that isn't in the locked list.
+    private func unsubscribeFromAppEvents() {
+        if let obs = activationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+        }
+        activationObserver = nil
+    }
+
     private func dismissAllAppOverlays() {
         for (_, w) in overlayWindows { w.orderOut(nil) }
         overlayWindows.removeAll()
@@ -362,17 +267,6 @@ final class AppLockModule: ForgeModule, ObservableObject {
 
     // MARK: - Quit interception
 
-    /// Cmd+Q while an overlay is key would quit Forge itself,
-    /// silently dropping every lock. We install a local keyDown
-    /// monitor while armed that catches those quit-adjacent
-    /// shortcuts (Cmd+Q / Cmd+W / Cmd+H) and reroutes them to
-    /// terminate the locked app instead — Slack's own Cmd+Q is
-    /// the natural "get out of here" action, and it re-locks
-    /// itself on next launch via the activation observer.
-    ///
-    /// Only intercepts when one of our lock windows actually holds
-    /// key focus, so hitting Cmd+Q in the Forge Settings window
-    /// still quits Forge normally.
     private func installQuitEventMonitor() {
         removeQuitEventMonitor()
         quitEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -386,12 +280,10 @@ final class AppLockModule: ForgeModule, ObservableObject {
             let cmd = event.modifierFlags.contains(.command)
             guard cmd else { return event }
 
-            // 12 = Q, 13 = W, 4 = H. All three would either quit
-            // Forge or hide it (which visually tears the overlay).
             switch event.keyCode {
             case 12, 13, 4:
                 self.handleQuitAttempt()
-                return nil   // consume
+                return nil
             default:
                 return event
             }
@@ -404,14 +296,8 @@ final class AppLockModule: ForgeModule, ObservableObject {
     }
 
     /// Fired when the user tries Cmd+Q/W/H over a lock overlay.
-    ///   • If a per-app overlay owns key: terminate that app,
-    ///     dismiss its overlay. Locked app is now truly gone, not
-    ///     silently unlocked.
-    ///   • If only the floating unlock window is key: dismiss it.
-    ///     Module stays armed; user can bring the prompt back with
-    ///     the ⌘L shortcut.
+    /// Terminates the locked app instead of quitting Forge.
     private func handleQuitAttempt() {
-        // Prefer whichever overlay is currently key.
         for (bid, window) in overlayWindows where window.isKeyWindow {
             if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bid).first {
                 app.terminate()
@@ -425,14 +311,32 @@ final class AppLockModule: ForgeModule, ObservableObject {
         }
     }
 
-    private func unsubscribeFromAppEvents() {
-        if let obs = activationObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+    // MARK: - Quit confirmation (Forge)
+
+    /// Whether AppDelegate should block Cmd+Q / Quit-Forge. True
+    /// while the module is armed — otherwise quitting silently
+    /// tears down every lock and exposes the locked apps.
+    var shouldBlockQuit: Bool { isEnabled }
+
+    /// Ask macOS to authenticate the user before quitting Forge.
+    /// No custom UI — just the native biometric / password prompt.
+    /// `completion(true)` = allow terminate, `completion(false)` =
+    /// cancel terminate.
+    func requestQuitConfirmation(completion: @escaping (Bool) -> Void) {
+        if quitAuthInFlight {
+            // A second quit request while the first is still
+            // asking. Second-in-line just gets a no.
+            completion(false)
+            return
         }
-        activationObserver = nil
+        quitAuthInFlight = true
+        authenticate(reason: "Quit Forge") { [weak self] ok in
+            self?.quitAuthInFlight = false
+            completion(ok)
+        }
     }
 
-    // MARK: - Per-app blocking overlay
+    // MARK: - Overlay windows
 
     private func presentOverlay(for sel: AppLockSelection) {
         if let existing = overlayWindows[sel.bundleId] {
@@ -447,10 +351,8 @@ final class AppLockModule: ForgeModule, ObservableObject {
             defer: false
         )
         // `.modalPanel` (8) sits above every normal app window but
-        // below the system menu bar (24) and dock (~20). Keeps the
-        // locked app covered while leaving system UI reachable so
-        // the user can Cmd+Tab, click other Dock icons, or hide
-        // the app from the Dock right-click menu.
+        // below the system menu bar (24) and dock (~20). System UI
+        // stays reachable while the locked app stays covered.
         window.level = .modalPanel
         window.isOpaque = false
         window.backgroundColor = .clear
@@ -460,18 +362,18 @@ final class AppLockModule: ForgeModule, ObservableObject {
         let host = NSHostingView(rootView: AppLockOverlayView(
             module: self,
             title: sel.displayName,
-            verifyPIN: { [weak self] pin in self?.verify(pin: pin) ?? false },
-            verifyBiometrics: { [weak self] done in
-                self?.unlockWithBiometrics(reason: "Unlock \(sel.displayName)", completion: done)
+            authenticate: { [weak self] done in
+                self?.authenticate(reason: "Unlock \(sel.displayName)") { ok in
+                    if ok {
+                        self?.dismissOverlay(bundleId: sel.bundleId)
+                        self?.finishDisarm()
+                    }
+                    done(ok)
+                }
             },
-            onSuccess: { [weak self] in self?.dismissOverlay(bundleId: sel.bundleId) },
             onMinimize: { [weak self] in
-                // hide() removes the app's windows from screen
-                // without quitting it. Notifications keep firing.
-                // Also drop the overlay explicitly — hide() doesn't
-                // reliably produce a `didActivate` notif for
-                // whoever becomes frontmost, so we can't rely on
-                // the observer path to tear it down.
+                // hide() removes windows from screen but keeps the
+                // process running so DMs / badges keep flowing.
                 if let app = NSRunningApplication.runningApplications(withBundleIdentifier: sel.bundleId).first {
                     app.hide()
                 }
@@ -493,8 +395,6 @@ final class AppLockModule: ForgeModule, ObservableObject {
         activeLocks.remove(bundleId)
     }
 
-    // MARK: - Floating unlock window
-
     private func presentUnlockWindow() {
         if let existing = unlockWindow {
             existing.makeKeyAndOrderFront(nil)
@@ -508,11 +408,6 @@ final class AppLockModule: ForgeModule, ObservableObject {
             backing: .buffered,
             defer: false
         )
-        // `.modalPanel` (8) sits above every normal app window but
-        // below the system menu bar (24) and dock (~20). Keeps the
-        // locked app covered while leaving system UI reachable so
-        // the user can Cmd+Tab, click other Dock icons, or hide
-        // the app from the Dock right-click menu.
         window.level = .modalPanel
         window.isOpaque = false
         window.backgroundColor = .clear
@@ -522,12 +417,16 @@ final class AppLockModule: ForgeModule, ObservableObject {
         let host = NSHostingView(rootView: AppLockOverlayView(
             module: self,
             title: "Locked",
-            verifyPIN: { [weak self] pin in self?.verify(pin: pin) ?? false },
-            verifyBiometrics: { [weak self] done in
-                self?.unlockWithBiometrics(reason: "Unlock apps", completion: done)
+            authenticate: { [weak self] done in
+                self?.authenticate(reason: "Unlock apps") { ok in
+                    if ok {
+                        self?.dismissUnlockWindow()
+                        self?.finishDisarm()
+                    }
+                    done(ok)
+                }
             },
-            onSuccess: { /* verify() already tears everything down */ },
-            onMinimize: nil   // no specific target app to hide
+            onMinimize: nil
         ))
         host.frame = NSRect(origin: .zero, size: screen.frame.size)
         host.autoresizingMask = [.width, .height]
@@ -542,98 +441,6 @@ final class AppLockModule: ForgeModule, ObservableObject {
         unlockWindow = nil
     }
 
-    // MARK: - Quit confirmation
-
-    /// Whether the AppDelegate should block Cmd+Q / Quit-Forge until
-    /// the user proves ownership. True while the module is armed —
-    /// otherwise Forge quit would silently drop every lock overlay
-    /// and expose the locked apps unlocked.
-    var shouldBlockQuit: Bool { isEnabled }
-
-    /// Ask the user to authorise quitting Forge with PIN or Touch
-    /// ID. Presents a floating panel using the same overlay UI as
-    /// unlock, but wires side-effect-free verifiers so a correct
-    /// PIN doesn't ALSO disarm the module — quit stays a quit,
-    /// unlock stays an unlock.
-    ///
-    /// `completion` fires exactly once. `true` = allow terminate,
-    /// `false` = cancel terminate.
-    func requestQuitConfirmation(completion: @escaping (Bool) -> Void) {
-        // If we're already asking, second-in-line callers just get
-        // an immediate no. AppDelegate maps this to
-        // .terminateCancel, which is what the user would want:
-        // "you're already answering that question, I'll wait."
-        if pendingQuitCompletion != nil {
-            completion(false)
-            return
-        }
-        pendingQuitCompletion = completion
-        presentQuitConfirmWindow()
-        // Auto-fire Touch ID on the same beat the window renders,
-        // matching what the unlock and settings-gate flows do.
-        if biometricsAvailable {
-            authenticateWithBiometrics(reason: "Quit Forge") { [weak self] ok in
-                if ok { self?.resolveQuitConfirmation(true) }
-                // On fail/cancel we leave the panel up so the user
-                // can type the PIN instead.
-            }
-        }
-    }
-
-    private func presentQuitConfirmWindow() {
-        if let existing = quitConfirmWindow {
-            existing.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            return
-        }
-        guard let screen = NSScreen.main else { return }
-        let window = OverlayWindow(
-            contentRect: screen.frame,
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
-        window.level = .modalPanel
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        window.hasShadow = false
-        window.ignoresMouseEvents = false
-
-        // Same overlay UI, but verifiers are side-effect free —
-        // checkPIN and authenticateWithBiometrics both just return
-        // a bool without disarming. Success resolves the pending
-        // quit callback with true.
-        let host = NSHostingView(rootView: AppLockOverlayView(
-            module: self,
-            title: "Quit Forge",
-            verifyPIN: { [weak self] pin in self?.checkPIN(pin) ?? false },
-            verifyBiometrics: { [weak self] done in
-                guard let self = self else { done(false); return }
-                self.authenticateWithBiometrics(reason: "Quit Forge", completion: done)
-            },
-            onSuccess: { [weak self] in self?.resolveQuitConfirmation(true) },
-            onMinimize: nil
-        ))
-        host.frame = NSRect(origin: .zero, size: screen.frame.size)
-        host.autoresizingMask = [.width, .height]
-        window.contentView = host
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        quitConfirmWindow = window
-    }
-
-    /// Resolve the outstanding quit-confirmation with the given
-    /// outcome. Called by the overlay's success closure (true) or
-    /// by AppDelegate cancel paths (false).
-    func resolveQuitConfirmation(_ authorized: Bool) {
-        quitConfirmWindow?.orderOut(nil)
-        quitConfirmWindow = nil
-        let cb = pendingQuitCompletion
-        pendingQuitCompletion = nil
-        cb?(authorized)
-    }
-
     // MARK: - Persistence
 
     private static func loadConfig() -> AppLockConfig {
@@ -645,27 +452,10 @@ final class AppLockModule: ForgeModule, ObservableObject {
     }
 
     private func persist() {
-        let cfg = AppLockConfig(
-            selections: selections,
-            pinHash: pinHash,
-            pinSalt: pinSalt
-        )
+        let cfg = AppLockConfig(selections: selections)
         if let data = try? JSONEncoder().encode(cfg) {
             try? data.write(to: Self.configURL)
         }
-    }
-
-    private static func hash(pin: String, saltHex: String) -> String {
-        var hasher = SHA256()
-        hasher.update(data: Data(saltHex.utf8))
-        hasher.update(data: Data(pin.utf8))
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
-    }
-
-    private static func randomSaltHex() -> String {
-        var bytes = [UInt8](repeating: 0, count: 16)
-        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-        return bytes.map { String(format: "%02x", $0) }.joined()
     }
 }
 
