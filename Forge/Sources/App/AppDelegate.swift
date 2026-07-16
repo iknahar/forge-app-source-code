@@ -441,6 +441,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         let textExpanderModule = TextExpanderModule()
         moduleRegistry.register(textExpanderModule)
 
+        // App Lock — PIN-lock specific apps (Slack, Chrome…) while
+        // the Mac itself stays unlocked. Paints a full-screen PIN
+        // prompt over each locked app's windows on activation;
+        // process itself keeps running so notifications still fire.
+        let appLockModule = AppLockModule()
+        // Weak back-ref so armForLock / finishDisarm can drive the
+        // shared activate/deactivate + persistence path.
+        appLockModule.registryRef = moduleRegistry
+        moduleRegistry.register(appLockModule)
+
         // Bridge the per-action enable toggles into gesture handlers
         // so flipping the Settings toggle silences them in real time.
         // Captures `settingsManager` weakly via self — Swift retains
@@ -516,6 +526,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         }
         registerHotkey("openTerminal", binding: b["openTerminal"]) { [weak self] in
             self?.moduleRegistry.module(ofType: TerminalLauncherModule.self)?.launch()
+        }
+        // App Lock — same shortcut in both directions. If unlocked
+        // it locks; if locked it pops the PIN prompt.
+        registerHotkey("appLock", binding: b["appLock"]) { [weak self] in
+            self?.moduleRegistry.module(ofType: AppLockModule.self)?.toggleFromShortcut()
         }
     }
 

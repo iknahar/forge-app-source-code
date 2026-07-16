@@ -417,6 +417,7 @@ struct ShortcutBinding: Codable, Equatable {
         "clipboard":        ShortcutBinding(keyCode: 9,  modifiers: [.option]),                // ⌥V
         "claudeLauncher":   ShortcutBinding(keyCode: 40, modifiers: [.control, .option]),      // ⌃⌥K
         "openTerminal":     ShortcutBinding(keyCode: 17, modifiers: [.control, .option, .shift]), // ⌃⌥⇧T
+        "appLock":          ShortcutBinding(keyCode: 37, modifiers: [.command]),                 // ⌘L
     ]
 
     /// Grouping for the Settings → Shortcuts list. Each group renders
@@ -428,6 +429,7 @@ struct ShortcutBinding: Codable, Equatable {
         case input         = "Mouse & Highlights"
         case files         = "Files & Clipboard"
         case developer     = "Developer"
+        case security      = "Security"
         var id: String { rawValue }
         var iconName: String {
             switch self {
@@ -437,6 +439,7 @@ struct ShortcutBinding: Codable, Equatable {
             case .input:     return "cursorarrow.click.2"
             case .files:     return "doc.on.clipboard"
             case .developer: return "terminal"
+            case .security:  return "lock.app.dashed"
             }
         }
     }
@@ -518,6 +521,11 @@ struct ShortcutBinding: Codable, Equatable {
         .init(id: "claudeLauncher", name: "Open Terminal · Claude",
               description: "Open Terminal and start a Claude Code session in a new window.",
               group: .developer, gestureLabel: nil),
+
+        // Security
+        .init(id: "appLock", name: "Lock / Unlock apps",
+              description: "One key does both: locks the selected apps when unlocked, opens the PIN prompt when locked.",
+              group: .security, gestureLabel: nil),
     ]
 
     /// Flat view of keystroke-bindable actions. Used by the hotkey

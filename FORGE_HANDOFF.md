@@ -58,6 +58,7 @@ Forge/
     │   ├── MenuBarView.swift                 # Popover content (Calendar tab + Tools tab + gear)
     │   └── SettingsView.swift                # Top-tab settings window (General / Calendar / Key Remap / Menu Bar / Shortcuts / About)
     └── Modules/
+        ├── AppLock/                          # AppLockModule (SIGSTOP/SIGCONT), AppLockOverlayView, AppLockSettingsView
         ├── Calendar/                         # CalendarModule, FullCalendarView, CalendarView, QuickCreateEventSheet,
         │                                     # EventDetailCardPopover, AttendeePickerField, ContactsDirectory,
         │                                     # WorldClockManagerPopover, MeetingLauncher
@@ -166,6 +167,10 @@ Forge's main popover wraps content in `ScrollableContainer` (NSScrollView shim) 
 - ✅ **Clipboard History (`ClipboardModule`)** — ⌃⌥V. Polls `NSPasteboard.changeCount` every 600ms, captures text/image/files, dedupes against previous entry, max 100 entries (oldest non-pinned evicted), top 20 images persist across launches. Floating panel (`ClipboardHistoryPanel`) with search, pin, remove, click-to-paste-back, type-pill (TEXT/IMAGE/FILES), provider thumbnails.
 - ✅ **Claude Code launcher (`ClaudeLauncherModule.launch`)** — ⌃⌥K. AppleScript opens Terminal and runs `claude`. Falls back to install hint if missing.
 - ✅ **Open Terminal (`ClaudeLauncherModule.launchPlainTerminal`)** — ⌃⌥⇧T. Plain Terminal window, no command.
+
+### Security
+
+- ✅ **App Lock (`AppLockModule`)** — user picks apps (Slack, Chrome, Mail, anything) + sets one global 4-digit PIN. Menu-bar toggle "Lock selected apps?" arms/disarms the module. When armed, `NSWorkspace.didActivateApplicationNotification` triggers `kill(pid, SIGSTOP)` across every process in the bundle (catches Chromium helpers) and paints a `.screenSaver`-level PIN prompt (`AppLockOverlayView` — "I know what you want to do."). Correct PIN → `SIGCONT` + overlay dismiss. Two modes: **oneTime** (unlock persists until master toggle off) and **frequent** (re-locks on every activation). Salted SHA-256 PIN hash, constant-time compare on verify. Config at `~/Library/Application Support/Forge/app_lock.json`. Arm state deliberately not persisted (reboot defaults to unlocked). Rest of macOS stays fully usable while a specific app is locked.
 
 ### Settings
 

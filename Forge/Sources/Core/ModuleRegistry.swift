@@ -16,6 +16,14 @@ final class ModuleRegistry: ObservableObject {
     /// alone does NOT fire `@Published` invalidation).
     @Published private var enabledStates: [String: Bool] = [:]
 
+    /// Set by `loadStates(from:)` and read by `toggleModule(_:)` to persist
+    /// the flip immediately — without this, a Tools-toggle change lived only
+    /// in-memory and got wiped on the next launch (`loadStates` overwrites
+    /// `isEnabled` from `settings.moduleStates`, which the toggle never
+    /// updated). Weak so the registry doesn't extend the settings manager's
+    /// lifetime.
+    private weak var settingsRef: SettingsManager?
+
     // MARK: - Registration
 
     func register(_ module: any ForgeModule) {
@@ -82,11 +90,27 @@ final class ModuleRegistry: ObservableObject {
             module.deactivate()
             print("[Forge] Disabled: \(module.name)")
         }
+
+        // Persist immediately. A module's `activate()` may self-abort
+        // (e.g. AppLock refuses to arm without a PIN + selections and
+        // resets `isEnabled` back to false) — re-sync `enabledStates`
+        // to the module's actual flag before saving so what we
+        // persist matches what the module actually did.
+        if enabledStates[id] != module.isEnabled {
+            enabledStates[id] = module.isEnabled
+        }
+        if let settings = settingsRef {
+            saveStates(to: settings)
+        }
     }
 
     // MARK: - State Persistence
 
     func loadStates(from settings: SettingsManager) {
+        // Keep the ref for `toggleModule` to save through. Same
+        // instance the AppDelegate creates once at launch, so no
+        // risk of races.
+        self.settingsRef = settings
         let states = settings.moduleStates
         for module in modules {
             if let saved = states[module.id] {

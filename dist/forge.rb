@@ -1,10 +1,10 @@
 cask "forge" do
-  version "1.0.16"
-  sha256 "357839332f494f12afd3a2eb3145de6a48ad43ec475c4764982a761fddd4589c"
+  version "1.0.17"
+  sha256 "b2031705f4f826e86234dac244428bbb0f9baffa1c4d9d814136bd2366402624"
 
   url "https://github.com/iknahar/forge-app-source-code/releases/download/v#{version}/Forge-#{version}.dmg"
   name "Forge"
-  desc "Native macOS menu-bar productivity toolkit (calendar, clipboard, window snap, eye-care, screen tools)"
+  desc "Native macOS menu-bar productivity toolkit (calendar, clipboard, window snap, eye-care, screen tools, per-app PIN lock)"
   homepage "https://forge-toolkit.vercel.app/"
 
   app "Forge.app"

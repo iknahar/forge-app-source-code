@@ -44,6 +44,7 @@ struct SettingsView: View {
         case launchers    = "Launchers"
         case keyRemap     = "Key Remap"
         case textExpander = "Text Expander"
+        case appLock      = "App Lock"
         case menuBar      = "Menu Bar"
         case shortcuts    = "Shortcuts"
 
@@ -57,6 +58,7 @@ struct SettingsView: View {
             case .launchers:    return "bolt.fill"
             case .keyRemap:     return "keyboard"
             case .textExpander: return "text.cursor"
+            case .appLock:      return "lock.app.dashed"
             case .menuBar:      return "menubar.rectangle"
             case .shortcuts:    return "keyboard.fill"
             }
@@ -70,6 +72,7 @@ struct SettingsView: View {
             case .launchers:    return "Bind a shortcut to open any app, document, or URL."
             case .keyRemap:     return "Remap any key combo to another, system-wide or per-app."
             case .textExpander: return "Type a trigger, get an expansion. Like aText / TextExpander."
+            case .appLock:      return "PIN-lock specific apps so no one can touch them while your Mac is unlocked."
             case .menuBar:      return "Compose what shows next to the hammer icon."
             case .shortcuts:    return "Toggle, re-record, or disable any Forge action. Changes register live."
             }
@@ -191,6 +194,7 @@ struct SettingsView: View {
                                 case .launchers:    launchersSettings
                                 case .keyRemap:     keyRemapSettings
                                 case .textExpander: EmptyView()
+                                case .appLock:      appLockSettings
                                 case .menuBar:      menuBarSettings
                                 case .shortcuts:    shortcutsSettings
                                 }
@@ -645,6 +649,20 @@ struct SettingsView: View {
         }
     }
 
+    /// App Lock settings page — pick apps to PIN-lock while the Mac
+    /// itself stays unlocked. Same lookup pattern as the other
+    /// module-owned pages.
+    private var appLockSettings: some View {
+        Group {
+            if let module = moduleRegistry.module(ofType: AppLockModule.self) {
+                AppLockSettingsView(module: module)
+            } else {
+                Text("App Lock module is unavailable.")
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+
     private var keyRemapSettings: some View {
         // Look up the module from the registry. We render the UI lazily
         // and gracefully degrade if KeyRemap isn't registered for some
@@ -893,6 +911,7 @@ private struct SettingsPreviewPane: View {
                 case .launchers:    EmptyView()
                 case .keyRemap:     EmptyView()
                 case .textExpander: EmptyView()
+                case .appLock:      EmptyView()
                 case .menuBar:      MenuBarPreview(settings: settings, isDark: previewIsDark)
                 case .shortcuts:    ShortcutsPreview(settings: settings, isDark: previewIsDark)
                 }
@@ -1585,14 +1604,31 @@ private struct ModuleRowSetting: View {
 
             Spacer()
 
-            Toggle("", isOn: Binding(
-                get: { registry.isEnabled(module.id) },
-                set: { _ in registry.toggleModule(module.id) }
-            ))
-            .toggleStyle(.forge)
-            .labelsHidden()
-            .tint(ForgeTheme.Colors.accent)
-            .controlSize(.small)
+            // Same AppLock special case as the menu-bar Tools list:
+            // toggle-on locks, toggle-off pops the PIN prompt.
+            if module.id == "appLock",
+               let al = registry.module(ofType: AppLockModule.self) {
+                Toggle("", isOn: Binding(
+                    get: { registry.isEnabled(module.id) },
+                    set: { newValue in
+                        if newValue { al.armForLock() }
+                        else        { al.requestUnlock() }
+                    }
+                ))
+                .toggleStyle(.forge)
+                .labelsHidden()
+                .tint(ForgeTheme.Colors.accent)
+                .controlSize(.small)
+            } else {
+                Toggle("", isOn: Binding(
+                    get: { registry.isEnabled(module.id) },
+                    set: { _ in registry.toggleModule(module.id) }
+                ))
+                .toggleStyle(.forge)
+                .labelsHidden()
+                .tint(ForgeTheme.Colors.accent)
+                .controlSize(.small)
+            }
         }
         .padding(.vertical, 5)
     }
