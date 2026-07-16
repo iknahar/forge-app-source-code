@@ -85,6 +85,16 @@ final class AppLockModule: ForgeModule, ObservableObject {
     /// disarm without a specific app in focus. Separate from
     /// `overlayWindows` because it isn't tied to any bundleId.
     private var unlockWindow: NSWindow?
+    /// Modal window shown when the user tries to quit Forge while
+    /// the module is armed. Success authorises the quit without
+    /// disarming the module (so the locked apps stay locked in
+    /// the *next* Forge run — assuming the user relaunches).
+    private var quitConfirmWindow: NSWindow?
+    /// Latched callback so multiple concurrent quit-attempt paths
+    /// (⌘Q, dock right-click, Cmd+Q from the popover) don't spawn
+    /// duplicate windows. First caller wins; subsequent calls
+    /// resolve to false immediately.
+    private var pendingQuitCompletion: ((Bool) -> Void)?
 
     /// Set by AppDelegate right after registration. Used so
     /// `armForLock()` and `finishDisarm()` can drive the same
@@ -450,6 +460,10 @@ final class AppLockModule: ForgeModule, ObservableObject {
         let host = NSHostingView(rootView: AppLockOverlayView(
             module: self,
             title: sel.displayName,
+            verifyPIN: { [weak self] pin in self?.verify(pin: pin) ?? false },
+            verifyBiometrics: { [weak self] done in
+                self?.unlockWithBiometrics(reason: "Unlock \(sel.displayName)", completion: done)
+            },
             onSuccess: { [weak self] in self?.dismissOverlay(bundleId: sel.bundleId) },
             onMinimize: { [weak self] in
                 // hide() removes the app's windows from screen
@@ -508,6 +522,10 @@ final class AppLockModule: ForgeModule, ObservableObject {
         let host = NSHostingView(rootView: AppLockOverlayView(
             module: self,
             title: "Locked",
+            verifyPIN: { [weak self] pin in self?.verify(pin: pin) ?? false },
+            verifyBiometrics: { [weak self] done in
+                self?.unlockWithBiometrics(reason: "Unlock apps", completion: done)
+            },
             onSuccess: { /* verify() already tears everything down */ },
             onMinimize: nil   // no specific target app to hide
         ))
@@ -522,6 +540,98 @@ final class AppLockModule: ForgeModule, ObservableObject {
     func dismissUnlockWindow() {
         unlockWindow?.orderOut(nil)
         unlockWindow = nil
+    }
+
+    // MARK: - Quit confirmation
+
+    /// Whether the AppDelegate should block Cmd+Q / Quit-Forge until
+    /// the user proves ownership. True while the module is armed —
+    /// otherwise Forge quit would silently drop every lock overlay
+    /// and expose the locked apps unlocked.
+    var shouldBlockQuit: Bool { isEnabled }
+
+    /// Ask the user to authorise quitting Forge with PIN or Touch
+    /// ID. Presents a floating panel using the same overlay UI as
+    /// unlock, but wires side-effect-free verifiers so a correct
+    /// PIN doesn't ALSO disarm the module — quit stays a quit,
+    /// unlock stays an unlock.
+    ///
+    /// `completion` fires exactly once. `true` = allow terminate,
+    /// `false` = cancel terminate.
+    func requestQuitConfirmation(completion: @escaping (Bool) -> Void) {
+        // If we're already asking, second-in-line callers just get
+        // an immediate no. AppDelegate maps this to
+        // .terminateCancel, which is what the user would want:
+        // "you're already answering that question, I'll wait."
+        if pendingQuitCompletion != nil {
+            completion(false)
+            return
+        }
+        pendingQuitCompletion = completion
+        presentQuitConfirmWindow()
+        // Auto-fire Touch ID on the same beat the window renders,
+        // matching what the unlock and settings-gate flows do.
+        if biometricsAvailable {
+            authenticateWithBiometrics(reason: "Quit Forge") { [weak self] ok in
+                if ok { self?.resolveQuitConfirmation(true) }
+                // On fail/cancel we leave the panel up so the user
+                // can type the PIN instead.
+            }
+        }
+    }
+
+    private func presentQuitConfirmWindow() {
+        if let existing = quitConfirmWindow {
+            existing.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        guard let screen = NSScreen.main else { return }
+        let window = OverlayWindow(
+            contentRect: screen.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.level = .modalPanel
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        window.hasShadow = false
+        window.ignoresMouseEvents = false
+
+        // Same overlay UI, but verifiers are side-effect free —
+        // checkPIN and authenticateWithBiometrics both just return
+        // a bool without disarming. Success resolves the pending
+        // quit callback with true.
+        let host = NSHostingView(rootView: AppLockOverlayView(
+            module: self,
+            title: "Quit Forge",
+            verifyPIN: { [weak self] pin in self?.checkPIN(pin) ?? false },
+            verifyBiometrics: { [weak self] done in
+                guard let self = self else { done(false); return }
+                self.authenticateWithBiometrics(reason: "Quit Forge", completion: done)
+            },
+            onSuccess: { [weak self] in self?.resolveQuitConfirmation(true) },
+            onMinimize: nil
+        ))
+        host.frame = NSRect(origin: .zero, size: screen.frame.size)
+        host.autoresizingMask = [.width, .height]
+        window.contentView = host
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        quitConfirmWindow = window
+    }
+
+    /// Resolve the outstanding quit-confirmation with the given
+    /// outcome. Called by the overlay's success closure (true) or
+    /// by AppDelegate cancel paths (false).
+    func resolveQuitConfirmation(_ authorized: Bool) {
+        quitConfirmWindow?.orderOut(nil)
+        quitConfirmWindow = nil
+        let cb = pendingQuitCompletion
+        pendingQuitCompletion = nil
+        cb?(authorized)
     }
 
     // MARK: - Persistence

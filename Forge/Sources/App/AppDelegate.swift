@@ -167,6 +167,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         print("[Forge] applicationDidFinishLaunching COMPLETE")
     }
 
+    /// Block Forge quit while App Lock is armed — otherwise quitting
+    /// tears down every lock overlay and leaves the locked apps
+    /// unlocked. When armed, we return `.terminateLater` and hand
+    /// off to `AppLockModule.requestQuitConfirmation` which prompts
+    /// for PIN / Touch ID. Success → `.reply(true)`; cancel → `.reply(false)`.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard
+            let lock = moduleRegistry.module(ofType: AppLockModule.self),
+            lock.shouldBlockQuit
+        else {
+            return .terminateNow
+        }
+        lock.requestQuitConfirmation { authorized in
+            NSApp.reply(toApplicationShouldTerminate: authorized)
+        }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         // Flush any debounced settings write synchronously so a change
         // made in the last fraction of a second before quit survives.

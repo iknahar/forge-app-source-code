@@ -13,16 +13,27 @@ import AppKit
 struct AppLockOverlayView: View {
     @ObservedObject var module: AppLockModule
     /// App display name for per-app overlays, or "Locked" for the
-    /// floating unlock window.
+    /// floating unlock window, or "Quit Forge" for the quit gate.
     let title: String
-    /// Called after `module.verify` returns true. Per-app overlays
-    /// use this to tear down their specific window; the floating
-    /// unlock window ignores it (verify itself handles teardown).
+    /// PIN verifier. Injected so different callers can plug in
+    /// different side effects: unlock flows call `module.verify`
+    /// (which disarms + tears down); the quit-authorization flow
+    /// calls `module.checkPIN` so a correct PIN doesn't also
+    /// unlock every locked app.
+    let verifyPIN: (String) -> Bool
+    /// Biometric verifier — kicks off `LAContext.evaluatePolicy`
+    /// and returns success/fail via the callback. Same injection
+    /// story: unlock flows can chain a disarm; quit-authorization
+    /// just needs the boolean.
+    let verifyBiometrics: (@escaping (Bool) -> Void) -> Void
+    /// Called after `verifyPIN` returns true OR biometric verify
+    /// resolves true. Overlay teardown, dismiss window, allow-quit,
+    /// whatever — the caller decides.
     let onSuccess: () -> Void
     /// Non-nil on per-app overlays: hides the locked app (its
     /// windows disappear, process keeps running so notifications
     /// still arrive) and dismisses this overlay. Nil on the
-    /// floating unlock window — there's no specific app to hide.
+    /// floating unlock window and the quit gate.
     let onMinimize: (() -> Void)?
 
     @State private var pin: String = ""
@@ -201,8 +212,7 @@ struct AppLockOverlayView: View {
     }
 
     private func submit() {
-        let ok = module.verify(pin: pin)
-        if ok {
+        if verifyPIN(pin) {
             onSuccess()
         } else {
             withAnimation(.default) { shake.toggle() }
@@ -214,16 +224,13 @@ struct AppLockOverlayView: View {
         }
     }
 
-    /// Fire Touch ID for unlock. Success = same effect as verify()
-    /// with a correct PIN: module disarms, overlay dismisses. Cancel
-    /// or fail leaves the PIN field usable as before.
+    /// Fire Touch ID. Success runs onSuccess (same target as a
+    /// correct PIN). Cancel/fail leaves the PIN field intact.
     private func runTouchID() {
-        module.unlockWithBiometrics(reason: "Unlock \(title)") { ok in
+        verifyBiometrics { ok in
             if ok { onSuccess() }
-            // On failure/cancel we deliberately don't set an error —
-            // Touch ID prompts are noisy enough that a "canceled"
-            // toast would just add friction. User can retap the
-            // button or type the PIN.
+            // No error toast on cancel — Touch ID prompts are noisy
+            // enough; user can retap the button or type the PIN.
         }
     }
 }
