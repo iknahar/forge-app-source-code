@@ -19,6 +19,22 @@ struct AppLockSettingsView: View {
     @State private var showingPINSheet = false
 
     var body: some View {
+        // Gate the entire section behind the PIN once per Forge run.
+        // Any modification here (add/remove app, change PIN, toggle
+        // arm state) needs the PIN first — regardless of whether
+        // the module is currently locked or unlocked. Skipped when
+        // no PIN exists yet, because the setup flow itself can't
+        // require a PIN.
+        Group {
+            if module.hasPIN && !module.settingsSessionUnlocked {
+                SettingsGate(module: module)
+            } else {
+                settingsBody
+            }
+        }
+    }
+
+    private var settingsBody: some View {
         VStack(alignment: .leading, spacing: 24) {
             lockStatusCard
             pinCard
@@ -266,6 +282,134 @@ struct AppLockSettingsView: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 22)
+    }
+}
+
+// MARK: - Settings gate
+
+/// One-time PIN gate at the top of the App Lock settings page.
+/// Blocks the actual controls (add/remove app, change PIN, arm
+/// toggle) until the user proves ownership. Success flips a
+/// session-lifetime flag on the module — no re-prompting for the
+/// rest of this Forge run, but a fresh launch re-gates.
+private struct SettingsGate: View {
+    @ObservedObject var module: AppLockModule
+
+    @State private var pin: String = ""
+    @State private var errorMessage: String? = nil
+    @State private var shake: Bool = false
+    @FocusState private var focused: Bool
+
+    private let pinLength = 4
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Image(systemName: "lock.shield.fill")
+                .font(.system(size: 36, weight: .semibold))
+                .foregroundColor(ForgeTheme.Colors.accent)
+                .padding(.top, 6)
+
+            Text("Enter PIN to modify App Lock")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundColor(ForgeTheme.Colors.textPrimary)
+            Text("Every change here — adding apps, removing apps, changing the PIN — needs your PIN first.")
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 360)
+
+            pinDots
+                .modifier(GateShake(shake: shake))
+
+            if let msg = errorMessage {
+                Text(msg)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(ForgeTheme.Colors.accentRed)
+            }
+
+            hiddenPINField
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 40)
+        .padding(.horizontal, 24)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(ForgeTheme.Colors.surfaceCard)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(ForgeTheme.Colors.borderDefault, lineWidth: 1)
+        )
+        .onAppear { focused = true }
+        .onChange(of: pin) { newValue in
+            let digits = newValue.filter { $0.isNumber }
+            if digits != newValue {
+                pin = String(digits.prefix(pinLength))
+                return
+            }
+            if newValue.count > pinLength {
+                pin = String(newValue.prefix(pinLength))
+                return
+            }
+            errorMessage = nil
+            if newValue.count == pinLength { submit() }
+        }
+    }
+
+    private var pinDots: some View {
+        HStack(spacing: 16) {
+            ForEach(0..<pinLength, id: \.self) { idx in
+                let filled = idx < pin.count
+                Circle()
+                    .stroke(ForgeTheme.Colors.textTertiary.opacity(filled ? 0 : 0.55), lineWidth: 1.5)
+                    .background(
+                        Circle().fill(filled ? ForgeTheme.Colors.accent : Color.clear)
+                    )
+                    .frame(width: 16, height: 16)
+                    .animation(.spring(response: 0.2, dampingFraction: 0.7), value: filled)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { focused = true }
+    }
+
+    /// Same offscreen-SecureField trick as the lock overlay: real
+    /// editable field drives the model, the dot row above is
+    /// purely visual.
+    private var hiddenPINField: some View {
+        SecureField("", text: $pin)
+            .textFieldStyle(.plain)
+            .focused($focused)
+            .frame(width: 1, height: 1)
+            .opacity(0.01)
+            .accessibilityLabel("PIN")
+            .onSubmit { submit() }
+    }
+
+    private func submit() {
+        if module.checkPIN(pin) {
+            module.settingsSessionUnlocked = true
+        } else {
+            withAnimation(.default) { shake.toggle() }
+            errorMessage = "Wrong PIN."
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                pin = ""
+                focused = true
+            }
+        }
+    }
+}
+
+private struct GateShake: GeometryEffect {
+    var amount: CGFloat = 6
+    var shakesPerUnit = CGFloat(3)
+    var animatableData: CGFloat
+
+    init(shake: Bool) { self.animatableData = shake ? 1 : 0 }
+
+    func effectValue(size: CGSize) -> ProjectionTransform {
+        let x = amount * sin(animatableData * .pi * shakesPerUnit * 2)
+        return ProjectionTransform(CGAffineTransform(translationX: x, y: 0))
     }
 }
 

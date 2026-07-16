@@ -57,6 +57,12 @@ final class AppLockModule: ForgeModule, ObservableObject {
     /// this to show a "LOCKED" chip per row.
     @Published private(set) var activeLocks: Set<String> = []
     @Published private(set) var hasPIN: Bool = false
+    /// Session-lifetime gate for the Settings → App Lock section.
+    /// Any modification (add app, remove app, change PIN, toggle
+    /// selection state) requires the user to punch the PIN in first
+    /// on this Forge run. Reset every launch, never persisted — a
+    /// fresh session always re-prompts.
+    @Published var settingsSessionUnlocked: Bool = false
 
     // MARK: - Internals
 
@@ -218,34 +224,33 @@ final class AppLockModule: ForgeModule, ObservableObject {
     /// short new PIN; caller surfaces the error.
     @discardableResult
     func changePIN(oldPIN: String, newPIN: String) -> Bool {
-        guard hasPIN else { return false }
-        guard newPIN.count >= 4 else { return false }
-        // Reuse the same constant-time compare that verify() does
-        // so timing gives nothing away.
-        let candidate = Self.hash(pin: oldPIN, saltHex: pinSalt)
-        guard candidate.count == pinHash.count else { return false }
-        var diff: UInt8 = 0
-        for (a, b) in zip(candidate.utf8, pinHash.utf8) { diff |= a ^ b }
-        guard diff == 0 else { return false }
+        guard hasPIN, newPIN.count >= 4 else { return false }
+        guard checkPIN(oldPIN) else { return false }
         pinSalt = Self.randomSaltHex()
         pinHash = Self.hash(pin: newPIN, saltHex: pinSalt)
         persist()
         return true
     }
 
-    /// Constant-time compare — the PIN space is 10^4 so an early-out
-    /// mismatch would leak digit-by-digit correctness via timing.
-    /// Called from both the per-app overlay and the floating unlock
-    /// window. On success, disarms the module entirely — every
-    /// locked app comes back at once.
-    @discardableResult
-    func verify(pin: String) -> Bool {
+    /// Constant-time compare against the stored PIN hash. Side-effect
+    /// free — the caller decides what to do on success. The PIN
+    /// space is 10^4 so an early-out mismatch would leak digit-by-
+    /// digit correctness via timing.
+    func checkPIN(_ pin: String) -> Bool {
         guard !pinHash.isEmpty else { return false }
         let candidate = Self.hash(pin: pin, saltHex: pinSalt)
         guard candidate.count == pinHash.count else { return false }
         var diff: UInt8 = 0
         for (a, b) in zip(candidate.utf8, pinHash.utf8) { diff |= a ^ b }
-        guard diff == 0 else { return false }
+        return diff == 0
+    }
+
+    /// Called from both the per-app overlay and the floating unlock
+    /// window. On success, disarms the module entirely — every
+    /// locked app comes back at once.
+    @discardableResult
+    func verify(pin: String) -> Bool {
+        guard checkPIN(pin) else { return false }
         dismissUnlockWindow()
         finishDisarm()
         return true
