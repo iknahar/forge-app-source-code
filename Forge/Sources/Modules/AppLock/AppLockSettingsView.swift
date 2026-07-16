@@ -327,6 +327,17 @@ private struct SettingsGate: View {
                     .foregroundColor(ForgeTheme.Colors.accentRed)
             }
 
+            // Touch ID shortcut. Same effect as a correct PIN —
+            // flips the session-unlocked flag on the module.
+            if module.biometricsAvailable {
+                Button(action: runTouchID) {
+                    Label("Use Touch ID", systemImage: "touchid")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .buttonStyle(.bordered)
+                .tint(ForgeTheme.Colors.accent)
+            }
+
             hiddenPINField
         }
         .frame(maxWidth: .infinity)
@@ -340,7 +351,13 @@ private struct SettingsGate: View {
             RoundedRectangle(cornerRadius: 14)
                 .stroke(ForgeTheme.Colors.borderDefault, lineWidth: 1)
         )
-        .onAppear { focused = true }
+        .onAppear {
+            focused = true
+            // Auto-prompt Touch ID on section-open so users don't
+            // have to reach for the keyboard. Falls through to PIN
+            // silently on cancel / no biometric hardware.
+            if module.biometricsAvailable { runTouchID() }
+        }
         .onChange(of: pin) { newValue in
             let digits = newValue.filter { $0.isNumber }
             if digits != newValue {
@@ -396,6 +413,14 @@ private struct SettingsGate: View {
                 pin = ""
                 focused = true
             }
+        }
+    }
+
+    /// Touch ID path for the settings gate. Success flips the
+    /// session-unlocked flag — same target state as a correct PIN.
+    private func runTouchID() {
+        module.authenticateWithBiometrics(reason: "Modify App Lock settings") { ok in
+            if ok { module.settingsSessionUnlocked = true }
         }
     }
 }

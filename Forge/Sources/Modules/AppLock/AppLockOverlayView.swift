@@ -68,6 +68,24 @@ struct AppLockOverlayView: View {
                         .transition(.opacity)
                 }
 
+                // Touch ID shortcut — same effect as a correct PIN.
+                // Only renders when the Mac actually has Touch ID
+                // available (no button on Intel Macs without a
+                // Touch ID keyboard, or if biometrics aren't
+                // enrolled).
+                if module.biometricsAvailable {
+                    Button(action: runTouchID) {
+                        Label("Use Touch ID", systemImage: "touchid")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.9))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+                            .background(Capsule().fill(Color.white.opacity(0.1)))
+                            .overlay(Capsule().stroke(Color.white.opacity(0.15), lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                }
+
                 // Minimize CTA — hides the locked app (windows off
                 // screen, process still running so DMs / badges
                 // keep flowing) and drops this overlay. User can
@@ -105,7 +123,13 @@ struct AppLockOverlayView: View {
             )
             .frame(width: 440)
         }
-        .onAppear { pinFocused = true }
+        .onAppear {
+            pinFocused = true
+            // Fire the Touch ID prompt right away — same UX macOS's
+            // own lock screen gives. Users on non-biometric Macs
+            // fall through to PIN entry as before.
+            if module.biometricsAvailable { runTouchID() }
+        }
         .onChange(of: pin) { newValue in
             let digits = newValue.filter { $0.isNumber }
             if digits != newValue {
@@ -187,6 +211,19 @@ struct AppLockOverlayView: View {
                 pin = ""
                 pinFocused = true
             }
+        }
+    }
+
+    /// Fire Touch ID for unlock. Success = same effect as verify()
+    /// with a correct PIN: module disarms, overlay dismisses. Cancel
+    /// or fail leaves the PIN field usable as before.
+    private func runTouchID() {
+        module.unlockWithBiometrics(reason: "Unlock \(title)") { ok in
+            if ok { onSuccess() }
+            // On failure/cancel we deliberately don't set an error —
+            // Touch ID prompts are noisy enough that a "canceled"
+            // toast would just add friction. User can retap the
+            // button or type the PIN.
         }
     }
 }

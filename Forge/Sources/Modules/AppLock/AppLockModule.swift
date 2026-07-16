@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Combine
 import CryptoKit
+import LocalAuthentication
 
 // MARK: - Types
 
@@ -230,6 +231,61 @@ final class AppLockModule: ForgeModule, ObservableObject {
         pinHash = Self.hash(pin: newPIN, saltHex: pinSalt)
         persist()
         return true
+    }
+
+    // MARK: - Biometrics (Touch ID)
+
+    /// True on Macs with a working Touch ID enrolment. Recomputed on
+    /// every access because sensor availability can change (user
+    /// re-enrolls a fingerprint, plugs in a Touch ID keyboard, etc.).
+    var biometricsAvailable: Bool {
+        var error: NSError?
+        return LAContext().canEvaluatePolicy(
+            .deviceOwnerAuthenticationWithBiometrics,
+            error: &error
+        )
+    }
+
+    /// Run the system Touch ID prompt asynchronously. Completion
+    /// always fires on the main queue so UI code can flip state
+    /// without extra dispatch. Passes `true` only on successful
+    /// biometric verification — cancel, fallback-to-password, and
+    /// LA errors all resolve to `false`.
+    func authenticateWithBiometrics(reason: String, completion: @escaping (Bool) -> Void) {
+        // A fresh context per call — reusing one across attempts
+        // caches the previous result and can bypass the prompt in
+        // ways we don't want here.
+        let ctx = LAContext()
+        // "Touch ID" localized reason is what the system shows on
+        // the prompt; keep it action-specific ("Unlock Slack",
+        // "Modify App Lock settings") so users know why.
+        ctx.localizedFallbackTitle = ""   // hide "Enter Password" fallback — PIN is our fallback
+        var error: NSError?
+        guard ctx.canEvaluatePolicy(
+            .deviceOwnerAuthenticationWithBiometrics,
+            error: &error
+        ) else {
+            completion(false); return
+        }
+        ctx.evaluatePolicy(
+            .deviceOwnerAuthenticationWithBiometrics,
+            localizedReason: reason
+        ) { ok, _ in
+            DispatchQueue.main.async { completion(ok) }
+        }
+    }
+
+    /// Convenience: Touch ID for the full unlock flow. Same side
+    /// effects as a correct PIN — dismisses the unlock window and
+    /// disarms the module.
+    func unlockWithBiometrics(reason: String, completion: @escaping (Bool) -> Void) {
+        authenticateWithBiometrics(reason: reason) { [weak self] ok in
+            if ok {
+                self?.dismissUnlockWindow()
+                self?.finishDisarm()
+            }
+            completion(ok)
+        }
     }
 
     /// Constant-time compare against the stored PIN hash. Side-effect
