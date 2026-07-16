@@ -309,33 +309,24 @@ private struct SettingsGate: View {
                 .foregroundColor(ForgeTheme.Colors.accent)
                 .padding(.top, 6)
 
-            Text("Enter PIN to modify App Lock")
+            Text(module.biometricsAvailable
+                 ? "Authenticate to modify App Lock"
+                 : "Enter PIN to modify App Lock")
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundColor(ForgeTheme.Colors.textPrimary)
-            Text("Every change here — adding apps, removing apps, changing the PIN — needs your PIN first.")
+            Text("Every change here — adding apps, removing apps, changing the PIN — needs Touch ID or your PIN first.")
                 .font(.system(size: 12))
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 360)
 
-            pinDots
+            authWidget
                 .modifier(GateShake(shake: shake))
 
             if let msg = errorMessage {
                 Text(msg)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(ForgeTheme.Colors.accentRed)
-            }
-
-            // Touch ID shortcut. Same effect as a correct PIN —
-            // flips the session-unlocked flag on the module.
-            if module.biometricsAvailable {
-                Button(action: runTouchID) {
-                    Label("Use Touch ID", systemImage: "touchid")
-                        .font(.system(size: 12, weight: .semibold))
-                }
-                .buttonStyle(.bordered)
-                .tint(ForgeTheme.Colors.accent)
             }
 
             hiddenPINField
@@ -373,21 +364,47 @@ private struct SettingsGate: View {
         }
     }
 
-    private var pinDots: some View {
-        HStack(spacing: 16) {
-            ForEach(0..<pinLength, id: \.self) { idx in
-                let filled = idx < pin.count
+    /// Merged auth widget for the settings gate — same shape as the
+    /// lock overlay but on a light card background instead of a
+    /// dark one, so the colors flip.
+    private var authWidget: some View {
+        HStack(spacing: 18) {
+            if module.biometricsAvailable {
+                Button(action: runTouchID) {
+                    Image(systemName: "touchid")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundColor(ForgeTheme.Colors.accent)
+                        .frame(width: 40, height: 40)
+                        .background(
+                            Circle().fill(ForgeTheme.Colors.accent.opacity(0.12))
+                        )
+                        .overlay(
+                            Circle().stroke(ForgeTheme.Colors.accent.opacity(0.35), lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+                .help("Tap for Touch ID")
+
                 Circle()
-                    .stroke(ForgeTheme.Colors.textTertiary.opacity(filled ? 0 : 0.55), lineWidth: 1.5)
-                    .background(
-                        Circle().fill(filled ? ForgeTheme.Colors.accent : Color.clear)
-                    )
-                    .frame(width: 16, height: 16)
-                    .animation(.spring(response: 0.2, dampingFraction: 0.7), value: filled)
+                    .fill(ForgeTheme.Colors.textTertiary.opacity(0.5))
+                    .frame(width: 3, height: 3)
             }
+
+            HStack(spacing: 14) {
+                ForEach(0..<pinLength, id: \.self) { idx in
+                    let filled = idx < pin.count
+                    Circle()
+                        .stroke(ForgeTheme.Colors.textTertiary.opacity(filled ? 0 : 0.55), lineWidth: 1.5)
+                        .background(
+                            Circle().fill(filled ? ForgeTheme.Colors.accent : Color.clear)
+                        )
+                        .frame(width: 14, height: 14)
+                        .animation(.spring(response: 0.2, dampingFraction: 0.7), value: filled)
+                }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { focused = true }
         }
-        .contentShape(Rectangle())
-        .onTapGesture { focused = true }
     }
 
     /// Same offscreen-SecureField trick as the lock overlay: real

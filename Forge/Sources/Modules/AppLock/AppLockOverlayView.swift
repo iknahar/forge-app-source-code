@@ -69,7 +69,7 @@ struct AppLockOverlayView: View {
                         .foregroundColor(.white.opacity(0.7))
                 }
 
-                pinDots
+                authWidget
                     .modifier(ShakeModifier(shake: shake))
 
                 if let msg = errorMessage {
@@ -77,24 +77,6 @@ struct AppLockOverlayView: View {
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(Color(hex: "#FCA5A5"))
                         .transition(.opacity)
-                }
-
-                // Touch ID shortcut — same effect as a correct PIN.
-                // Only renders when the Mac actually has Touch ID
-                // available (no button on Intel Macs without a
-                // Touch ID keyboard, or if biometrics aren't
-                // enrolled).
-                if module.biometricsAvailable {
-                    Button(action: runTouchID) {
-                        Label("Use Touch ID", systemImage: "touchid")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundColor(.white.opacity(0.9))
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 7)
-                            .background(Capsule().fill(Color.white.opacity(0.1)))
-                            .overlay(Capsule().stroke(Color.white.opacity(0.15), lineWidth: 1))
-                    }
-                    .buttonStyle(.plain)
                 }
 
                 // Minimize CTA — hides the locked app (windows off
@@ -184,19 +166,45 @@ struct AppLockOverlayView: View {
         }
     }
 
-    private var pinDots: some View {
-        HStack(spacing: 18) {
-            ForEach(0..<pinLength, id: \.self) { idx in
-                let filled = idx < pin.count
+    /// Merged auth widget. Fingerprint glyph on the left (only when
+    /// biometrics are available) is a tappable "retry Touch ID"
+    /// button. PIN dots on the right fill as the user types. One
+    /// row, either input path lands in the same success flow.
+    private var authWidget: some View {
+        HStack(spacing: 20) {
+            if module.biometricsAvailable {
+                Button(action: runTouchID) {
+                    Image(systemName: "touchid")
+                        .font(.system(size: 26, weight: .semibold))
+                        .foregroundColor(.white)
+                        .frame(width: 44, height: 44)
+                        .background(Circle().fill(Color.white.opacity(0.1)))
+                        .overlay(Circle().stroke(Color.white.opacity(0.2), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .help("Tap for Touch ID")
+
+                // Small separator dot — reads as related-but-
+                // distinct paths, without the harsh line of a
+                // Divider.
                 Circle()
-                    .stroke(Color.white.opacity(filled ? 0 : 0.35), lineWidth: 1.5)
-                    .background(Circle().fill(filled ? Color.white : Color.clear))
-                    .frame(width: 18, height: 18)
-                    .animation(.spring(response: 0.2, dampingFraction: 0.7), value: filled)
+                    .fill(Color.white.opacity(0.25))
+                    .frame(width: 3, height: 3)
             }
+
+            HStack(spacing: 16) {
+                ForEach(0..<pinLength, id: \.self) { idx in
+                    let filled = idx < pin.count
+                    Circle()
+                        .stroke(Color.white.opacity(filled ? 0 : 0.35), lineWidth: 1.5)
+                        .background(Circle().fill(filled ? Color.white : Color.clear))
+                        .frame(width: 16, height: 16)
+                        .animation(.spring(response: 0.2, dampingFraction: 0.7), value: filled)
+                }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { pinFocused = true }
         }
-        .contentShape(Rectangle())
-        .onTapGesture { pinFocused = true }
     }
 
     /// Offscreen editable SecureField that drives the model — the
