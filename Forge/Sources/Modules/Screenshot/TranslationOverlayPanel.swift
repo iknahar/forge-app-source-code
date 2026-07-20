@@ -65,8 +65,9 @@ struct TranslationOverlayPanel: View {
     /// the controls can live OUTSIDE this rect.
     private var selectionLayer: some View {
         ZStack {
-            // Faint base dim
-            Color.black.opacity(0.25)
+            // Base dim — deeper so the surrounding original content
+            // doesn't compete with the translated text for contrast.
+            Color.black.opacity(0.45)
 
             // Per-block dark overlay + translated text
             GeometryReader { geo in
@@ -110,7 +111,7 @@ struct TranslationOverlayPanel: View {
             // Heavy dim — the user shouldn't be able to read the
             // original through it, but the layout still shows through.
             RoundedRectangle(cornerRadius: 3)
-                .fill(Color.black.opacity(0.78))
+                .fill(Color.black.opacity(0.92))
 
             // Yellow on black for the translated text — better
             // contrast than white on black at small sizes, and

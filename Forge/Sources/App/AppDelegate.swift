@@ -102,6 +102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     /// well before either of those naturally happens, so we
     /// observe the source-of-truth directly.
     private var calendarEventsObserver: AnyCancellable?
+    private var appLockStateObserver: AnyCancellable?
     private var menuBarRefreshTimer: Timer?
 
     /// Live-pulse state for the "● Ongoing meeting" indicator.
@@ -787,6 +788,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                     self?.refreshMenuBar()
                 }
         }
+
+        // ── App Lock arm/disarm observer ─────────────────────────────────
+        //
+        // When App Lock is armed the menu-bar icon flips to a 🔒 so the
+        // locked state is visible at a glance. Arm/disarm goes through
+        // `ModuleRegistry.toggleModule`, which mutates the registry's
+        // `@Published enabledStates` — so the registry's `objectWillChange`
+        // is the reliable signal. (The module's own `isEnabled` is a plain
+        // Bool, not `@Published`, so we can't sink it directly.)
+        appLockStateObserver = moduleRegistry.objectWillChange
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { self?.refreshMenuBar() }
+            }
     }
 
     private func startMenuBarRefreshTimer() {
@@ -845,10 +859,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         let shouldShowIcon = tokens.contains(.icon) || renderedParts.isEmpty
         let userEmoji = settingsManager.menuBarEmoji.trimmingCharacters(in: .whitespacesAndNewlines)
 
+        // When App Lock is armed the whole menu-bar item becomes a 🔒,
+        // overriding the hammer / custom emoji, so the locked state reads
+        // at a glance. Any active text tokens (event countdown, clock) stay
+        // appended after the lock.
+        let appLocked = moduleRegistry.module(ofType: AppLockModule.self)?.isEnabled == true
+
         // Compose the final visible string so we can decide whether the
         // live-pulse timer needs to run.
         let finalTitle: String
-        if shouldShowIcon {
+        if appLocked {
+            button.image = nil
+            button.imagePosition = .noImage
+            finalTitle = renderedParts.isEmpty ? "🔒" : "🔒 \(titleText)"
+        } else if shouldShowIcon {
             if !userEmoji.isEmpty {
                 button.image = nil
                 button.imagePosition = .noImage
