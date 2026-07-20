@@ -51,6 +51,26 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
     private var overlayView: LightshotOverlayView?
     private var sessionRef: AnnotationSession?
 
+    /// One overlay window per physical monitor. The screenshot session
+    /// covers EVERY connected display at once — the user can start their
+    /// drag on whichever monitor they like, not just the one macOS reports
+    /// as `NSScreen.main`. The moment a drag begins on one surface, that
+    /// surface becomes the "active" one (mirrored into `regionWindow` /
+    /// `overlayView` / `fullScreenImage` / `activeScreen`) and the others
+    /// are frozen so only a single selection ever exists.
+    private struct OverlaySurface {
+        let screen: NSScreen
+        let window: OverlayWindow
+        let view: LightshotOverlayView
+        let image: CGImage
+    }
+    private var overlaySurfaces: [OverlaySurface] = []
+
+    /// The screen the current selection lives on. All crop/render math and
+    /// floating-panel positioning is done relative to this screen (its
+    /// `frame.origin` is non-zero for anything but the primary display).
+    private var activeScreen: NSScreen?
+
     /// Translator overlay state — non-nil while the magic translation
     /// panel is on screen on top of the selection rect.
     private var translatorPanel: NSPanel?
@@ -78,7 +98,8 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
         // Otherwise stray text panels / overlays leak between sessions —
         // notably the inline-text editor window, which floats outside
         // the new selection.
-        if overlayView != nil || regionWindow != nil || sessionRef != nil {
+        if overlayView != nil || regionWindow != nil || sessionRef != nil
+            || !overlaySurfaces.isEmpty {
             dismissLightshot()
         }
 
@@ -109,59 +130,68 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
         // of re-granting could fix a neutered API. SCK returns real pixels
         // once Screen Recording is granted, and lets us exclude Forge's own
         // windows so the menu popover never lands in the capture.
-        captureScreenViaSCK { [weak self] image in
+        captureAllScreensViaSCK { [weak self] captures in
             guard let self = self else { return }
-            guard let image = image, !Self.captureLooksBlank(image) else {
+            // Keep only screens that came back with real (non-blank) pixels.
+            let usable = captures.filter { !Self.captureLooksBlank($0.image) }
+            guard !usable.isEmpty else {
                 NotificationCenter.default.post(name: .forgeAfterScreenshotDismiss, object: nil)
                 self.presentScreenRecordingAlert()
                 return
             }
-            self.performCapture(preCaptured: image)
+            self.performCapture(captures: usable)
         }
     }
 
-    /// Full-display screenshot via ScreenCaptureKit. Excludes Forge's own
-    /// windows so the menu popover / overlays never appear in the capture.
-    /// Completion is always delivered on the main queue (nil on failure).
-    private func captureScreenViaSCK(_ completion: @escaping (CGImage?) -> Void) {
-        guard let screen = NSScreen.main else { completion(nil); return }
-        let wantedID = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
-            as? CGDirectDisplayID) ?? CGMainDisplayID()
-        let scale = screen.backingScaleFactor
-        let pxW = Int(screen.frame.width * scale)
-        let pxH = Int(screen.frame.height * scale)
+    /// Full-display screenshot of EVERY connected monitor via ScreenCaptureKit.
+    /// Excludes Forge's own windows so the menu popover / overlays never appear
+    /// in the capture. Completion delivers one `(screen, image)` pair per
+    /// display that captured successfully, always on the main queue (empty on
+    /// total failure).
+    private func captureAllScreensViaSCK(
+        _ completion: @escaping ([(screen: NSScreen, image: CGImage)]) -> Void
+    ) {
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else { completion([]); return }
 
         Task {
+            var results: [(screen: NSScreen, image: CGImage)] = []
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(
                     false, onScreenWindowsOnly: false
                 )
-                guard let display = content.displays.first(where: { $0.displayID == wantedID })
-                        ?? content.displays.first else {
-                    await MainActor.run { completion(nil) }
-                    return
-                }
                 // Exclude every window owned by Forge itself.
                 let ourApps = content.applications.filter {
                     $0.bundleIdentifier == Bundle.main.bundleIdentifier
                 }
-                let filter = SCContentFilter(
-                    display: display, excludingApplications: ourApps, exceptingWindows: []
-                )
-                let config = SCStreamConfiguration()
-                config.width = max(1, pxW)
-                config.height = max(1, pxH)
-                config.showsCursor = false
-                config.scalesToFit = false
 
-                let image = try await SCScreenshotManager.captureImage(
-                    contentFilter: filter, configuration: config
-                )
-                await MainActor.run { completion(image) }
+                for screen in screens {
+                    let wantedID = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
+                        as? CGDirectDisplayID) ?? CGMainDisplayID()
+                    guard let display = content.displays.first(where: { $0.displayID == wantedID })
+                    else { continue }
+
+                    let scale = screen.backingScaleFactor
+                    let filter = SCContentFilter(
+                        display: display, excludingApplications: ourApps, exceptingWindows: []
+                    )
+                    let config = SCStreamConfiguration()
+                    config.width = max(1, Int(screen.frame.width * scale))
+                    config.height = max(1, Int(screen.frame.height * scale))
+                    config.showsCursor = false
+                    config.scalesToFit = false
+
+                    if let image = try? await SCScreenshotManager.captureImage(
+                        contentFilter: filter, configuration: config
+                    ) {
+                        results.append((screen, image))
+                    }
+                }
             } catch {
                 NSLog("[Forge Screenshot] ScreenCaptureKit capture failed: \(error.localizedDescription)")
-                await MainActor.run { completion(nil) }
             }
+            let out = results
+            await MainActor.run { completion(out) }
         }
     }
 
@@ -220,79 +250,98 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
         }
     }
 
-    /// - Parameter preCaptured: The ScreenCaptureKit image from
-    ///   `startCapture()`. Already validated non-blank by the caller.
-    private func performCapture(preCaptured: CGImage? = nil) {
-        guard let screen = NSScreen.main else { return }
-
-        let screenFrame = screen.frame
-        let viewFrame = NSRect(origin: .zero, size: screenFrame.size)
-
+    /// Builds one full-screen overlay per captured monitor and shows them all
+    /// at once. The user may begin their selection on any display; the first
+    /// drag claims that display as the active one (see `selectionBegan`).
+    /// - Parameter captures: one non-blank `(screen, image)` pair per monitor.
+    private func performCapture(captures: [(screen: NSScreen, image: CGImage)]) {
         // The capture is produced by ScreenCaptureKit in `startCapture()`
-        // (CGWindowListCreateImage is dead on modern macOS). If it's somehow
-        // missing/too small, bail with the permission guidance.
-        guard let image = preCaptured, image.width >= 8, image.height >= 8 else {
+        // (CGWindowListCreateImage is dead on modern macOS). If nothing valid
+        // came back, bail with the permission guidance.
+        let valid = captures.filter { $0.image.width >= 8 && $0.image.height >= 8 }
+        guard !valid.isEmpty else {
             NotificationCenter.default.post(name: .forgeAfterScreenshotDismiss, object: nil)
             presentScreenRecordingAlert()
             return
         }
 
-        // A non-nil capture can still be EMPTY. On macOS 14+ the Screen
-        // Recording grant is pinned to the app's code signature; after an
-        // update changes the signature, CGPreflightScreenCaptureAccess()
-        // still returns true (the TCC row exists) but the window server
-        // hands back a fully-transparent image. The user then annotates
-        // an invisible screenshot and the export contains only their
-        // drawings. Detect the blank frame and guide them to re-grant
-        // instead of proceeding.
-        if Self.captureLooksBlank(image) {
-            NotificationCenter.default.post(name: .forgeAfterScreenshotDismiss, object: nil)
-            presentScreenRecordingAlert()
-            return
-        }
-        fullScreenImage = image
-
-        let view = LightshotOverlayView(frame: viewFrame)
-        view.capturedImage = image
-        view.onSelectionComplete = { [weak self] rect in self?.selectionLocked(rect) }
-        view.onCancel            = { [weak self] in self?.dismissLightshot() }
-        view.onSelectionChanged  = { [weak self] rect in self?.repositionToolbar(near: rect) }
-
-        let window = OverlayWindow(
-            contentRect: screenFrame,
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
-        // `.statusBar` is high enough to sit above normal app windows but
-        // low enough that the toolbar (placed one rung higher) can float on
-        // top of the overlay. `.screenSaver` was too high — the toolbar was
-        // being z-ordered under the overlay and never appeared.
-        window.level = .statusBar
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.ignoresMouseEvents = false
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        window.contentView = view
-        // Force the window to the physical screen.frame *after* setting the
-        // content view. Even though OverlayWindow disables the
-        // constrain-to-screen trim, some macOS versions still nudge the
-        // frame during makeKeyAndOrderFront(); an explicit setFrame post-
-        // ordering is the safest belt-and-suspenders.
-        window.setFrame(screenFrame, display: false)
-        // When the capture is triggered from the menu-bar popover, the popover
-        // closes and Forge (an .accessory app) resigns active — a plain
-        // makeKeyAndOrderFront on a borderless window then does NOT bring the
-        // overlay forward, so "nothing happens". Activate the app and order the
-        // window front unconditionally so the overlay always appears.
         NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
-        window.orderFrontRegardless()
-        window.setFrame(screenFrame, display: true)
-        window.makeFirstResponder(view)
+
+        for (screen, image) in valid {
+            let screenFrame = screen.frame
+            let viewFrame = NSRect(origin: .zero, size: screenFrame.size)
+
+            let view = LightshotOverlayView(frame: viewFrame)
+            view.capturedImage = image
+            // Each surface reports which screen it belongs to so the module
+            // can activate the right one the instant a drag starts there.
+            view.onSelectionBegan    = { [weak self] in self?.selectionBegan(on: screen) }
+            view.onSelectionComplete = { [weak self] rect in self?.selectionLocked(rect) }
+            view.onCancel            = { [weak self] in self?.dismissLightshot() }
+            view.onSelectionChanged  = { [weak self] rect in self?.repositionToolbar(near: rect) }
+
+            let window = OverlayWindow(
+                contentRect: screenFrame,
+                styleMask: [.borderless],
+                backing: .buffered,
+                defer: false
+            )
+            // `.statusBar` is high enough to sit above normal app windows but
+            // low enough that the toolbar (placed one rung higher) can float on
+            // top of the overlay. `.screenSaver` was too high — the toolbar was
+            // being z-ordered under the overlay and never appeared.
+            window.level = .statusBar
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            window.ignoresMouseEvents = false
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            window.contentView = view
+            // Force the window to the physical screen.frame *after* setting the
+            // content view. Even though OverlayWindow disables the
+            // constrain-to-screen trim, some macOS versions still nudge the
+            // frame during makeKeyAndOrderFront(); an explicit setFrame post-
+            // ordering is the safest belt-and-suspenders.
+            window.setFrame(screenFrame, display: false)
+            window.orderFrontRegardless()
+            window.setFrame(screenFrame, display: true)
+
+            overlaySurfaces.append(OverlaySurface(
+                screen: screen, window: window, view: view, image: image
+            ))
+        }
+
+        // Make the surface on the monitor that currently has the mouse the key
+        // window so Esc / keyboard reach a live responder before any drag. If
+        // the pointer isn't over any captured display, fall back to the first.
+        let mouse = NSEvent.mouseLocation
+        let keySurface = overlaySurfaces.first { NSMouseInRect(mouse, $0.screen.frame, false) }
+            ?? overlaySurfaces.first
+        if let key = keySurface {
+            key.window.makeKeyAndOrderFront(nil)
+            key.window.makeFirstResponder(key.view)
+        }
         NSCursor.crosshair.push()
-        regionWindow = window
-        overlayView = view
+    }
+
+    /// A drag started on `screen` — promote it to the active surface and
+    /// freeze every OTHER overlay so a second selection can't be started on a
+    /// different monitor mid-gesture.
+    private func selectionBegan(on screen: NSScreen) {
+        guard activeScreen !== screen || overlayView == nil else { return }
+        activeScreen = screen
+        if let surface = overlaySurfaces.first(where: { $0.screen === screen }) {
+            regionWindow    = surface.window
+            overlayView     = surface.view
+            fullScreenImage = surface.image
+            surface.window.makeKeyAndOrderFront(nil)
+            surface.window.makeFirstResponder(surface.view)
+        }
+        // Freeze the non-active overlays: they keep dimming their monitor but
+        // stop accepting mouse events, so the gesture stays on one screen.
+        for surface in overlaySurfaces where surface.screen !== screen {
+            surface.view.clearSelection()
+            surface.window.ignoresMouseEvents = true
+        }
     }
 
     /// User finished dragging — overlay stays alive, transitions to annotation
@@ -308,8 +357,20 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
         showToolbar(near: rect)
     }
 
+    /// Converts a rect expressed in the active overlay view's LOCAL coords
+    /// (origin at the active screen's bottom-left) into GLOBAL screen coords,
+    /// which is what floating panels (toolbar / translator) are positioned in.
+    /// On the primary display the active screen's origin is (0,0) so this is a
+    /// no-op; on any secondary monitor it applies the screen's offset.
+    private func globalRect(_ local: CGRect) -> CGRect {
+        guard let origin = activeScreen?.frame.origin else { return local }
+        return local.offsetBy(dx: origin.x, dy: origin.y)
+    }
+
     private func showToolbar(near selectionRect: CGRect) {
-        guard let session = sessionRef, let screen = NSScreen.main else { return }
+        guard let session = sessionRef, let screen = activeScreen else { return }
+        let sel = globalRect(selectionRect)
+        let sf = screen.frame
 
         let toolbar = LightshotToolbar(
             session: session,
@@ -334,13 +395,14 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
         // The uploading and success panels reuse this same width via Spacers so
         // they never visually "grow wider than the action bar".
         let toolbarHeight: CGFloat = 60
-        let toolbarWidth: CGFloat = max(720, selectionRect.width + 40)
-        var x = selectionRect.midX - toolbarWidth / 2
-        var y = selectionRect.minY - toolbarHeight - 10
-        // If there's no room below, flip to above the selection
-        if y < 20 { y = selectionRect.maxY + 10 }
-        // Clamp to screen edges
-        x = max(20, min(screen.frame.width - toolbarWidth - 20, x))
+        let toolbarGap: CGFloat = 6   // small gap so the bar hugs the selection
+        let toolbarWidth: CGFloat = max(720, sel.width + 40)
+        var x = sel.midX - toolbarWidth / 2
+        var y = sel.minY - toolbarHeight - toolbarGap
+        // If there's no room below on this screen, flip to above the selection.
+        if y < sf.minY + 20 { y = sel.maxY + toolbarGap }
+        // Clamp to the active screen's edges (global coords).
+        x = max(sf.minX + 20, min(sf.maxX - toolbarWidth - 20, x))
 
         let panel = NSPanel(
             contentRect: NSRect(x: x, y: y, width: toolbarWidth, height: toolbarHeight),
@@ -360,14 +422,17 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
         toolbarWindow = panel
     }
 
-    /// Reposition toolbar when selection moves (future: drag-resize selection).
+    /// Reposition toolbar when the selection is moved or resized.
     fileprivate func repositionToolbar(near rect: CGRect) {
-        guard let panel = toolbarWindow, let screen = NSScreen.main else { return }
+        guard let panel = toolbarWindow, let screen = activeScreen else { return }
+        let sel = globalRect(rect)
+        let sf = screen.frame
         let w = panel.frame.width
-        var x = rect.midX - w / 2
-        var y = rect.minY - panel.frame.height - 10
-        if y < 20 { y = rect.maxY + 10 }
-        x = max(20, min(screen.frame.width - w - 20, x))
+        let gap: CGFloat = 6
+        var x = sel.midX - w / 2
+        var y = sel.minY - panel.frame.height - gap
+        if y < sf.minY + 20 { y = sel.maxY + gap }
+        x = max(sf.minX + 20, min(sf.maxX - w - 20, x))
         panel.setFrameOrigin(NSPoint(x: x, y: y))
     }
 
@@ -379,10 +444,14 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
         overlayView?.forceCloseTextPanel()
 
         NSCursor.pop()
+        // Tear down every monitor's overlay window.
+        for surface in overlaySurfaces { surface.window.orderOut(nil) }
+        overlaySurfaces.removeAll()
         regionWindow?.orderOut(nil);   regionWindow = nil
         toolbarWindow?.orderOut(nil);  toolbarWindow = nil
         dismissTranslationOverlay()
         overlayView = nil
+        activeScreen = nil
         sessionRef = nil
         fullScreenImage = nil
         // Let paused overlay modules (Mouse Highlight) resume.
@@ -407,7 +476,7 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
             let view = overlayView,
             let session = sessionRef,
             let cgFull = fullScreenImage,
-            let screen = NSScreen.main
+            let screen = activeScreen
         else { return nil }
 
         let rect = view.selection
@@ -562,7 +631,7 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
         guard
             let view = overlayView,
             let cgFull = fullScreenImage,
-            let screen = NSScreen.main,
+            let screen = activeScreen,
             let settings = settingsRef
         else { return }
 
@@ -609,24 +678,30 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
         let panelWidth = max(rect.width, panelMinWidth)
         let panelHeight = rect.height + stripHeight + stripGap
 
+        // Panel placement happens in GLOBAL screen coords (the selection rect
+        // offset onto the active monitor), so the translator lands correctly
+        // on secondary displays whose frame origin isn't (0,0).
+        let sel = globalRect(rect)
+        let sf = screen.frame
+
         // Try ABOVE the selection first. If that would push the strip
         // off the top of the screen, flip BELOW.
-        let preferAbove = rect.maxY + stripHeight + stripGap <= screen.frame.maxY
+        let preferAbove = sel.maxY + stripHeight + stripGap <= sf.maxY
         // x — left-align with the selection but clamp to the screen.
-        var panelX = rect.minX
-        if panelX + panelWidth > screen.frame.maxX {
-            panelX = screen.frame.maxX - panelWidth
+        var panelX = sel.minX
+        if panelX + panelWidth > sf.maxX {
+            panelX = sf.maxX - panelWidth
         }
-        panelX = max(panelX, screen.frame.minX)
+        panelX = max(panelX, sf.minX)
         let panelY: CGFloat
         let stripIsBelow: Bool
         if preferAbove {
             // Panel covers [selection.minY ... selection.maxY + strip]
-            panelY = rect.minY
+            panelY = sel.minY
             stripIsBelow = false
         } else {
             // Panel covers [selection.minY - strip ... selection.maxY]
-            panelY = rect.minY - (stripHeight + stripGap)
+            panelY = sel.minY - (stripHeight + stripGap)
             stripIsBelow = true
         }
         let panelFrame = NSRect(x: panelX, y: panelY, width: panelWidth, height: panelHeight)
@@ -643,10 +718,10 @@ final class ScreenshotAnnotateModule: ForgeModule, ObservableObject {
         // off the top of the panel.
         let panelSize = panelFrame.size
         let selectionInPanel = NSRect(
-            x: rect.minX - panelFrame.minX,
+            x: sel.minX - panelFrame.minX,
             y: stripIsBelow ? 0 : (stripHeight + stripGap),
-            width: rect.width,
-            height: rect.height
+            width: sel.width,
+            height: sel.height
         )
         model.layoutMetrics = .init(
             panelSize: panelSize,
@@ -804,6 +879,11 @@ final class LightshotOverlayView: NSView {
     var capturedImage: CGImage?
     var onSelectionComplete: ((CGRect) -> Void)?
     var onCancel: (() -> Void)?
+    /// Called the instant the user starts dragging a selection on this
+    /// surface. In a multi-monitor session this is how the module learns
+    /// which display the gesture is happening on so it can activate that
+    /// screen and freeze the others.
+    var onSelectionBegan: (() -> Void)?
     /// Called whenever the selection's bounds change in annotating phase so
     /// the floating toolbar can be repositioned (move/resize).
     var onSelectionChanged: ((CGRect) -> Void)?
@@ -1006,6 +1086,9 @@ final class LightshotOverlayView: NSView {
         }
 
         if phase == .selecting {
+            // Claim this monitor as the active surface before anything else,
+            // so the module can freeze the other displays' overlays.
+            onSelectionBegan?()
             dragStart = p
             selection = NSRect(origin: p, size: .zero)
             dragMode = .selecting
@@ -1197,6 +1280,18 @@ final class LightshotOverlayView: NSView {
 
     private func updateSelectionSize() {
         session?.selectionSize = selection.size
+    }
+
+    /// Reset this surface back to an empty selecting state. Used on the
+    /// non-active monitors once a drag claims a different display, so no
+    /// stray half-drawn rect lingers on the other screens.
+    func clearSelection() {
+        phase = .selecting
+        dragMode = .none
+        selection = .zero
+        currentDrawItem = nil
+        updateSelectionSize()
+        needsDisplay = true
     }
 
     // MARK: Inline text editing
